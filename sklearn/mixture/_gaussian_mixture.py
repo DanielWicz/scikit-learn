@@ -5,6 +5,8 @@
 
 import numpy as np
 from scipy import linalg
+from joblib import Parallel, delayed
+    
 
 from ..utils import check_array
 from ..utils._param_validation import StrOptions
@@ -296,61 +298,49 @@ def _estimate_gaussian_parameters(X, resp, reg_covar, covariance_type):
 
 
 def _compute_precision_cholesky(covariances, covariance_type):
-    """Compute the Cholesky decomposition of the precisions.
-
-    Parameters
-    ----------
-    covariances : array-like
-        The covariance matrix of the current components.
-        The shape depends of the covariance_type.
-
-    covariance_type : {'full', 'tied', 'diag', 'spherical'}
-        The type of precision matrices.
-
-    Returns
-    -------
-    precisions_cholesky : array-like
-        The cholesky decomposition of sample precisions of the current
-        components. The shape depends of the covariance_type.
     """
-    estimate_precision_error_message = (
-        "Fitting the mixture model failed because some components have "
-        "ill-defined empirical covariance (for instance caused by singleton "
-        "or collapsed samples). Try to decrease the number of components, "
-        "increase reg_covar, or scale the input data."
-    )
+    Compute the Cholesky decomposition of precision matrices.
+
+    For 'full', factorizes and inverts each covariance in parallel
+    to exploit multiple CPU cores. Falls back to sequential for other types.
+    """
     dtype = covariances.dtype
-    if dtype == np.float32:
-        estimate_precision_error_message += (
-            " The numerical accuracy can also be improved by passing float64"
-            " data instead of float32."
-        )
+    # Shared error message
+    err_msg = (
+        "Fitting failed: ill-defined empirical covariance. "
+        "Try fewer components, larger reg_covar, or float64 inputs."
+    )
 
     if covariance_type == "full":
         n_components, n_features, _ = covariances.shape
-        precisions_chol = np.empty((n_components, n_features, n_features), dtype=dtype)
-        for k, covariance in enumerate(covariances):
+
+        def _process(cov):
+            # Factor and invert
             try:
-                cov_chol = linalg.cholesky(covariance, lower=True)
+                L = linalg.cholesky(cov, lower=True)
             except linalg.LinAlgError:
-                raise ValueError(estimate_precision_error_message)
-            precisions_chol[k] = linalg.solve_triangular(
-                cov_chol, np.eye(n_features, dtype=dtype), lower=True
-            ).T
+                raise ValueError(err_msg)
+            # Solve L * U = I  =>  U = L^{-1}
+            return linalg.solve_triangular(L, np.eye(n_features, dtype=dtype), lower=True).T
+
+        # Parallel over components
+        precisions_chol = Parallel(n_jobs=-1)(
+            delayed(_process)(cov) for cov in covariances
+        )
+        return np.stack(precisions_chol)
+
     elif covariance_type == "tied":
-        _, n_features = covariances.shape
         try:
-            cov_chol = linalg.cholesky(covariances, lower=True)
+            L = linalg.cholesky(covariances, lower=True)
         except linalg.LinAlgError:
-            raise ValueError(estimate_precision_error_message)
-        precisions_chol = linalg.solve_triangular(
-            cov_chol, np.eye(n_features, dtype=dtype), lower=True
-        ).T
+            raise ValueError(err_msg)
+        return linalg.solve_triangular(L, np.eye(L.shape[0], dtype=dtype), lower=True).T
+
     else:
-        if np.any(np.less_equal(covariances, 0.0)):
-            raise ValueError(estimate_precision_error_message)
-        precisions_chol = 1.0 / np.sqrt(covariances)
-    return precisions_chol
+        # diag or spherical
+        if np.any(covariances <= 0.0):
+            raise ValueError(err_msg)
+        return 1.0 / np.sqrt(covariances)
 
 
 def _flipudlr(array):
