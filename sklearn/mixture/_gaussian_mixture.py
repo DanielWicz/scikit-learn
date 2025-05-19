@@ -6,7 +6,7 @@
 import numpy as np
 from scipy import linalg
 from joblib import Parallel, delayed
-    
+from numba import njit, prange
 
 from ..utils import check_array
 from ..utils._param_validation import StrOptions

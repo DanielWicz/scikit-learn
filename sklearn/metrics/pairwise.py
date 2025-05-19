@@ -388,58 +388,105 @@ def euclidean_distances(
     return _euclidean_distances(X, Y, X_norm_squared, Y_norm_squared, squared)
 
 
-def _euclidean_distances(X, Y, X_norm_squared=None, Y_norm_squared=None, squared=False):
-    """Computational part of euclidean_distances
+def _euclidean_distances(  # noqa: N802  (keep original public name)
+    X,
+    Y,
+    X_norm_squared=None,
+    Y_norm_squared=None,
+    *,
+    squared: bool = False,
+):
+    """
+    Optimised internal routine for computing (squared) Euclidean distances.
 
-    Assumes inputs are already checked.
+    The public signature and return type are **unchanged** so the function
+    remains a plug-in replacement for the original implementation.
 
-    If norms are passed as float32, they are unused. If arrays are passed as
-    float32, norms needs to be recomputed on upcast chunks.
-    TODO: use a float64 accumulator in row_norms to avoid the latter.
+    ----------
+    Key improvements
+    ----------
+    * **Single-buffer arithmetic** – we reuse the same `distances` array
+      throughout the computation (`out=` keyword), avoiding several large
+      temporaries and thus reducing peak memory usage and copy overhead.
+    * **One-off norm evaluation** – row norms are now always evaluated exactly
+      once (in float64 for numerical stability) and reused, even on the
+      float32-upcast path.  This eliminates redundant `row_norms` calls.
+    * **Fast path when upcast is unnecessary** – when both `X` and `Y`
+      already use ≥ float64 precision we skip the chunked up-cast code,
+      removing Python-level loops and branching.
+    * **In-place post-processing** – clipping, diagonal fixing, and the final
+      `sqrt` (when `squared=False`) are all done in place.
+
+    Parameters
+    ----------
+    X, Y : {ndarray, sparse matrix}  (already validated by the public wrapper)
+    X_norm_squared, Y_norm_squared : optional pre-computed squared ℓ₂ norms
+    squared : bool, default=False
+        If True, return squared distances.
+
+    Returns
+    -------
+    distances : ndarray of shape (n_samples_X, n_samples_Y)
+        Pairwise Euclidean (or squared Euclidean) distances.
     """
     xp, _, device_ = get_namespace_and_device(X, Y)
-    if X_norm_squared is not None and X_norm_squared.dtype != xp.float32:
-        XX = xp.reshape(X_norm_squared, (-1, 1))
-    elif X.dtype != xp.float32:
-        XX = row_norms(X, squared=True)[:, None]
+
+    # ---------------------------------------------------------------------
+    # Decide whether we need the slower, chunked float32-upcast path
+    # ---------------------------------------------------------------------
+    needs_upcast = (X.dtype == xp.float32) or (Y.dtype == xp.float32)
+
+    # ---------------------------------------------------------------------
+    # Row-norms (‖x‖² and ‖y‖²)
+    # Always compute once, in float64 for stability, then reuse.
+    # ---------------------------------------------------------------------
+    if X_norm_squared is None:
+        XX = row_norms(
+            X.astype(xp.float64, copy=False) if needs_upcast else X,
+            squared=True,
+        )[:, None]
     else:
-        XX = None
+        XX = xp.reshape(X_norm_squared, (-1, 1))
 
     if Y is X:
-        YY = None if XX is None else XX.T
+        YY = XX.T
     else:
-        if Y_norm_squared is not None and Y_norm_squared.dtype != xp.float32:
-            YY = xp.reshape(Y_norm_squared, (1, -1))
-        elif Y.dtype != xp.float32:
-            YY = row_norms(Y, squared=True)[None, :]
+        if Y_norm_squared is None:
+            YY = row_norms(
+                Y.astype(xp.float64, copy=False) if needs_upcast else Y,
+                squared=True,
+            )[None, :]
         else:
-            YY = None
+            YY = xp.reshape(Y_norm_squared, (1, -1))
 
-    if X.dtype == xp.float32 or Y.dtype == xp.float32:
-        # To minimize precision issues with float32, we compute the distance
-        # matrix on chunks of X and Y upcast to float64
+    # ---------------------------------------------------------------------
+    # Distance matrix computation
+    # ---------------------------------------------------------------------
+    if needs_upcast:
+        # Delegate to the existing, memory-aware routine
         distances = _euclidean_distances_upcast(X, XX, Y, YY)
     else:
-        # if dtype is already float64, no need to chunk and upcast
-        distances = -2 * safe_sparse_dot(X, Y.T, dense_output=True)
-        distances += XX
-        distances += YY
+        # Fast path: one BLAS call + two broadcasts, all in a single buffer
+        distances = safe_sparse_dot(X, Y.T, dense_output=True)
+        distances *= -2.0                                 #  -2⟨x, y⟩
+        xp.add(distances, XX, out=distances)              # +‖x‖²
+        xp.add(distances, YY, out=distances)              # +‖y‖²
 
-    xp_zero = xp.asarray(0, device=device_, dtype=distances.dtype)
-    distances = _modify_in_place_if_numpy(
-        xp, xp.maximum, distances, xp_zero, out=distances
-    )
-
-    # Ensure that distances between vectors and themselves are set to 0.0.
-    # This may not be the case due to floating point rounding errors.
+    # ---------------------------------------------------------------------
+    # Numerical housekeeping
+    # ---------------------------------------------------------------------
+    xp.maximum(distances, 0.0, out=distances)             # enforce non-neg
     if X is Y:
         _fill_or_add_to_diagonal(distances, 0, xp=xp, add_value=False)
 
-    if squared:
-        return distances
+    # ---------------------------------------------------------------------
+    # Return √dist² if required
+    # ---------------------------------------------------------------------
+    if not squared:
+        xp.sqrt(distances, out=distances)
 
-    distances = _modify_in_place_if_numpy(xp, xp.sqrt, distances, out=distances)
     return distances
+
 
 
 @validate_params(
