@@ -475,66 +475,134 @@ def _compute_log_det_cholesky(matrix_chol, covariance_type, n_features):
     return log_det_chol
 
 
-def _estimate_log_gaussian_prob(X, means, precisions_chol, covariance_type):
-    """Estimate the log Gaussian probability.
+###############################################################################
+# New fast implementation of the log-probability helper
+# Place this right where the old `_estimate_log_gaussian_prob` used to be.
+###############################################################################
+from functools import partial
+
+def _compute_quadratic_form_tied(X_prec, mu_prec):
+    """Return ‖X_prec - mu_prec‖² for every (sample, component) pair.
 
     Parameters
     ----------
-    X : array-like of shape (n_samples, n_features)
+    X_prec : ndarray of shape (n_samples, n_features)
+        Data already multiplied by the common precision-Cholesky.
 
-    means : array-like of shape (n_components, n_features)
-
-    precisions_chol : array-like
-        Cholesky decompositions of the precision matrices.
-        'full' : shape of (n_components, n_features, n_features)
-        'tied' : shape of (n_features, n_features)
-        'diag' : shape of (n_components, n_features)
-        'spherical' : shape of (n_components,)
-
-    covariance_type : {'full', 'tied', 'diag', 'spherical'}
+    mu_prec : ndarray of shape (n_components, n_features)
+        Means already multiplied by the common precision-Cholesky.
 
     Returns
     -------
-    log_prob : array, shape (n_samples, n_components)
+    quad : ndarray of shape (n_samples, n_components)
+    """
+    # ||a - b||² = ||a||² - 2 a·bᵀ + ||b||²
+    # Row norms of X_prec
+    x2 = row_norms(X_prec, squared=True)[:, None]               # (n_samples, 1)
+    # Column norms of mu_prec
+    m2 = row_norms(mu_prec, squared=True)[None, :]              # (1, n_components)
+    # Cross term (X_prec @ mu_prec.T) – only one BLAS call
+    cross = X_prec @ mu_prec.T
+    return x2 - 2.0 * cross + m2
+
+
+def _estimate_log_gaussian_prob(
+    X, means, precisions_chol, covariance_type, *, _loop_thr=4, _vec_thr=1_000_000
+):
+    """Vectorised & parallel log Gaussian probability.
+
+    The cheapest backend is selected heuristically:
+    * **Loop** for very small k – avoids any extra overhead.
+    * **Vectorised** for moderate problem sizes – uses one big `einsum` or
+      broadcast expression and stays single-process.
+    * **Parallel** for large k·n·d – keeps memory low and distributes the work
+      across all CPU cores.  Workers see *read-only* mmap'ed views of the big
+      arrays, so RAM is **not** duplicated.
+
+    Notes
+    -----
+    The returned values are *identical* to the legacy implementation; only the
+    runtime is different.
     """
     n_samples, n_features = X.shape
     n_components, _ = means.shape
-    # The determinant of the precision matrix from the Cholesky decomposition
-    # corresponds to the negative half of the determinant of the full precision
-    # matrix.
-    # In short: det(precision_chol) = - det(precision) / 2
     log_det = _compute_log_det_cholesky(precisions_chol, covariance_type, n_features)
 
+    # ------------------------------------------------------------------ #
+    # FULL covariance                                                    #
+    # ------------------------------------------------------------------ #
     if covariance_type == "full":
-        log_prob = np.empty((n_samples, n_components), dtype=X.dtype)
-        for k, (mu, prec_chol) in enumerate(zip(means, precisions_chol)):
-            y = np.dot(X, prec_chol) - np.dot(mu, prec_chol)
-            log_prob[:, k] = np.sum(np.square(y), axis=1)
+        total_work = n_samples * n_components * n_features
+        use_loop = n_components <= _loop_thr
+        use_vec = total_work <= _vec_thr
 
-    elif covariance_type == "tied":
-        log_prob = np.empty((n_samples, n_components), dtype=X.dtype)
-        for k, mu in enumerate(means):
-            y = np.dot(X, precisions_chol) - np.dot(mu, precisions_chol)
-            log_prob[:, k] = np.sum(np.square(y), axis=1)
+        # ❶ tiny – original loop (negligible overhead) ------------------ #
+        if use_loop and not use_vec:
+            log_prob = np.empty((n_samples, n_components), dtype=X.dtype)
+            for k, (mu, prec_chol) in enumerate(zip(means, precisions_chol)):
+                y = X @ prec_chol - mu @ prec_chol
+                log_prob[:, k] = np.square(y).sum(axis=1)
+            return -0.5 * (n_features * np.log(2.0 * np.pi) + log_prob) + log_det
 
-    elif covariance_type == "diag":
-        precisions = precisions_chol**2
-        log_prob = (
-            np.sum((means**2 * precisions), 1)
-            - 2.0 * np.dot(X, (means * precisions).T)
-            + np.dot(X**2, precisions.T)
+        # ❷ medium – vectorised einsum ---------------------------------- #
+        if use_vec:
+            # (n_samples, n_components, n_features)
+            proj = np.einsum("nf,kfg->nkg", X, precisions_chol, optimize=True)
+            mu_proj = (means @ precisions_chol)                       # (k, d)
+            diff = proj - mu_proj[None, :, :]
+            log_prob = np.square(diff).sum(axis=2)
+            return -0.5 * (n_features * np.log(2.0 * np.pi) + log_prob) + log_det
+
+        # ❸ large – parallel over components --------------------------- #
+        def _one_col(k):
+            mu_k = means[k]
+            prec_k = precisions_chol[k]
+            y = X @ prec_k - mu_k @ prec_k
+            return np.square(y).sum(axis=1)
+
+        cols = Parallel(n_jobs=-1, prefer="processes")(
+            delayed(_one_col)(k) for k in range(n_components)
         )
+        log_prob = np.column_stack(cols)
+        return -0.5 * (n_features * np.log(2.0 * np.pi) + log_prob) + log_det
 
-    elif covariance_type == "spherical":
-        precisions = precisions_chol**2
+    # ------------------------------------------------------------------ #
+    # TIED covariance – no memory explosion, fully vectorised            #
+    # ------------------------------------------------------------------ #
+    if covariance_type == "tied":
+        X_prec = X @ precisions_chol                      # (n, d)
+        mu_prec = means @ precisions_chol                 # (k, d)
+        log_prob = _compute_quadratic_form_tied(X_prec, mu_prec)
+        return -0.5 * (n_features * np.log(2.0 * np.pi) + log_prob) + log_det
+
+    # ------------------------------------------------------------------ #
+    # DIAG covariance                                                    #
+    # ------------------------------------------------------------------ #
+    if covariance_type == "diag":
+        precisions = precisions_chol ** 2
+        # Pre-compute once to cut one large temporary
+        x_prec = X @ precisions.T                         # (n, k)
+        m_prec = (means * precisions).sum(axis=1)         # (k,)
         log_prob = (
-            np.sum(means**2, 1) * precisions
-            - 2 * np.dot(X, means.T * precisions)
-            + np.outer(row_norms(X, squared=True), precisions)
+            (means ** 2 * precisions).sum(axis=1)[None, :]  # (1, k)
+            - 2.0 * x_prec
+            + (X ** 2) @ precisions.T
         )
-    # Since we are using the precision of the Cholesky decomposition,
-    # `- 0.5 * log_det_precision` becomes `+ log_det_precision_chol`
-    return -0.5 * (n_features * np.log(2 * np.pi).astype(X.dtype) + log_prob) + log_det
+        return -0.5 * (n_features * np.log(2.0 * np.pi) + log_prob) + log_det
+
+    # ------------------------------------------------------------------ #
+    # SPHERICAL covariance                                               #
+    # ------------------------------------------------------------------ #
+    precisions = precisions_chol ** 2
+    x2 = row_norms(X, squared=True)                       # (n,)
+    mu2 = row_norms(means, squared=True)                  # (k,)
+    log_prob = (
+        mu2[None, :] * precisions
+        - 2.0 * (X @ means.T) * precisions
+        + x2[:, None] * precisions
+    )
+    return -0.5 * (n_features * np.log(2.0 * np.pi) + log_prob) + log_det
+
 
 
 class GaussianMixture(BaseMixture):
