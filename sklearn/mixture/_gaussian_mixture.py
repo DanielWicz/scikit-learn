@@ -11,7 +11,7 @@ from ..utils import check_array
 from ..utils._param_validation import StrOptions
 from ..utils.extmath import row_norms
 from ._base import BaseMixture, _check_shape
-
+N_PROCESS_FIXED = 16
 ###############################################################################
 # Gaussian mixture shape checkers used by the GaussianMixture class
 
@@ -210,7 +210,7 @@ def _estimate_gaussian_covariances_full(resp, X, nk, means, reg_covar):
         cov.flat[:: n_features + 1] += reg_covar
         return cov
 
-    covariances = Parallel(n_jobs=-1, backend="loky")(
+    covariances = Parallel(n_jobs=N_PROCESS_FIXED, backend="loky")(
         delayed(_one_cov)(k) for k in range(n_components)
     )
     return np.stack(covariances)
@@ -605,7 +605,7 @@ def _estimate_log_gaussian_prob(
             y = X @ prec_k - mu_k @ prec_k
             return np.square(y).sum(axis=1)
 
-        cols = Parallel(n_jobs=-1, backend="loky")(
+        cols = Parallel(n_jobs=N_PROCESS_FIXED, backend="loky")(
             delayed(_one_col)(k) for k in range(n_components)
         )
         log_prob = np.column_stack(cols)
