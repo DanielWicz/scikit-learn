@@ -210,7 +210,7 @@ def _estimate_gaussian_covariances_full(resp, X, nk, means, reg_covar):
         cov.flat[:: n_features + 1] += reg_covar
         return cov
 
-    covariances = Parallel(n_jobs=-1, prefer="processes")(
+    covariances = Parallel(n_jobs=-1, backend="loky")(
         delayed(_one_cov)(k) for k in range(n_components)
     )
     return np.stack(covariances)
@@ -610,7 +610,7 @@ def _estimate_log_gaussian_prob(
             y = X @ prec_k - mu_k @ prec_k
             return np.square(y).sum(axis=1)
 
-        cols = Parallel(n_jobs=-1, prefer="processes")(
+        cols = Parallel(n_jobs=-1, backend="loky")(
             delayed(_one_col)(k) for k in range(n_components)
         )
         log_prob = np.column_stack(cols)
