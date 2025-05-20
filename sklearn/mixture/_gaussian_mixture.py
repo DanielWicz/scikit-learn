@@ -1010,16 +1010,11 @@ class GaussianMixture(BaseMixture):
 
         dtype = self.precisions_cholesky_.dtype
         if self.covariance_type == "full":
-            self.precisions_ = np.empty_like(self.precisions_cholesky_)
-            for k, prec_chol in enumerate(self.precisions_cholesky_):
-                self.precisions_[k] = np.dot(prec_chol, prec_chol.T)
-
-        elif self.covariance_type == "tied":
-            self.precisions_ = np.dot(
-                self.precisions_cholesky_, self.precisions_cholesky_.T
-            )
+            # (k, d, d)  @  (k, d, d)^T  →  (k, d, d)
+            self.precisions_ = self.precisions_cholesky_ @ self.precisions_cholesky_.transpose(0, 2, 1)
         else:
-            self.precisions_ = self.precisions_cholesky_**2
+            self.precisions_ = self.precisions_cholesky_ ** 2 if self.covariance_type in {"diag", "spherical"} else self.precisions_cholesky_ @ self.precisions_cholesky_.T
+
 
     def _n_parameters(self):
         """Return the number of free parameters in the model."""
