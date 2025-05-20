@@ -48,6 +48,7 @@ from ._k_means_elkan import (
     init_bounds_sparse,
 )
 from ._k_means_lloyd import lloyd_iter_chunked_dense, lloyd_iter_chunked_sparse
+from ._k_means_plusplus import _kmeans_plusplus
 from ._k_means_minibatch import _minibatch_update_dense, _minibatch_update_sparse
 
 ###############################################################################
@@ -170,102 +171,6 @@ def kmeans_plusplus(
 
     return centers, indices
 
-
-def _kmeans_plusplus(
-    X,
-    n_clusters: int,
-    x_squared_norms: np.ndarray,
-    sample_weight: np.ndarray,
-    random_state: np.random.RandomState,
-    n_local_trials: int | None = None,
-):
-    """
-    Speed-optimized replacement for the original ``_kmeans_plusplus`` routine.
-
-    This version removes several Python-level loops and repeated temporary
-    allocations while remaining *drop-in compatible* with scikit-learn’s public
-    signature.  The main accelerations are:
-
-    * **Vectorised potential updates** – keep the weighted squared distances
-      ``distances_prob`` around and update it in-place each time a new
-      centre is accepted, instead of recomputing it from scratch.
-    * **BLAS-backed reductions with ``np.einsum``** – the weighted inertia of
-      every trial candidate is now obtained in one call
-      ``einsum('ki,i->k', ...)`` which maps to a GEMV on most BLAS libraries
-      and utilises all available CPU cores.
-    * **Fewer reshape/copy operations** – distances are kept one-dimensional
-      where possible and the expensive ``reshape(-1, 1)`` is dropped.
-    * **Typed early exits and minimal casting** – the inner‐loop variables are
-      reused in-place to keep memory pressure low.
-
-    Parameters
-    ----------
-    (same as the original implementation)
-    """
-    n_samples, n_features = X.shape
-    if n_samples == 0:
-        raise ValueError("Found array with 0 sample(s) while a minimum of 1 is required")
-
-    if n_local_trials is None:
-        # Arthur & Vassilvitskii’s heuristic: 2 + log(k)
-        n_local_trials = 2 + int(np.log(n_clusters))
-
-    # ------------------------------------------------------------------ #
-    # 1.  Pick the very first centre at random (weighted).                #
-    # ------------------------------------------------------------------ #
-    first_id = random_state.choice(n_samples, p=sample_weight / sample_weight.sum())
-    centers = np.empty((n_clusters, n_features), dtype=X.dtype, order="C")
-    centers[0] = X[first_id] if not sp.issparse(X) else X[[first_id]].toarray()
-    indices = np.full(n_clusters, -1, dtype=int)
-    indices[0] = first_id
-
-    # Pairwise squared distances from every point to the first centre.
-    closest_dist_sq = _euclidean_distances(
-        centers[0, np.newaxis], X, Y_norm_squared=x_squared_norms, squared=True
-    ).ravel()                                  # shape (n_samples,)
-
-    # Keep the weighted distances around – we will update them in-place.
-    distances_prob = closest_dist_sq * sample_weight
-    current_pot: float = distances_prob.sum()
-
-    # ------------------------------------------------------------------ #
-    # 2.  Greedily add the remaining centres.                            #
-    # ------------------------------------------------------------------ #
-    for c in range(1, n_clusters):
-        # -- 2-a) draw *n_local_trials* candidate indices ---------------
-        rand_vals = random_state.uniform(size=n_local_trials) * current_pot
-        candidate_ids = np.searchsorted(np.cumsum(distances_prob), rand_vals, side="left")
-        np.clip(candidate_ids, 0, n_samples - 1, out=candidate_ids)  # numerical safety
-
-        # -- 2-b) compute distances from every candidate to all points --
-        #      distance_to_candidates.shape == (n_local_trials, n_samples)
-        distance_to_candidates = _euclidean_distances(
-            X[candidate_ids], X, Y_norm_squared=x_squared_norms, squared=True
-        )
-
-        # -- 2-c) update “would-be” closest distances in one shot -------
-        # Broadcasted min across axis-0 (samples) for every candidate.
-        # We *reuse* ``distance_to_candidates`` to keep memory down.
-        np.minimum(closest_dist_sq, distance_to_candidates, out=distance_to_candidates)
-
-        # -- 2-d) inertia of each candidate using a single BLAS call ----
-        candidates_pot = np.einsum('ki,i->k', distance_to_candidates, sample_weight, optimize=True)
-        best_idx = int(np.argmin(candidates_pot))          # local best
-        best_candidate = int(candidate_ids[best_idx])
-
-        # Commit the chosen centre
-        if sp.issparse(X):
-            centers[c] = X[[best_candidate]].toarray()
-        else:
-            centers[c] = X[best_candidate]
-        indices[c] = best_candidate
-
-        # -- 2-e) refresh state for the next iteration ------------------
-        closest_dist_sq = distance_to_candidates[best_idx]  # already the minima
-        distances_prob = closest_dist_sq * sample_weight    # in-place would alias
-        current_pot = float(candidates_pot[best_idx])
-
-    return centers, indices
 
 
 ###############################################################################
