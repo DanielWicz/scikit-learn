@@ -511,30 +511,24 @@ class BaseMixture(DensityMixin, BaseEstimator, metaclass=ABCMeta):
         pass
 
     def _estimate_log_prob_resp(self, X):
-        """Estimate log probabilities and responsibilities for each sample.
+        """Return log p(X) and log-responsibilities for each sample.
 
-        Compute the log probabilities, weighted log probabilities per
-        component and responsibilities for each sample in X with respect to
-        the current state of the model.
-
-        Parameters
-        ----------
-        X : array-like of shape (n_samples, n_features)
-
-        Returns
-        -------
-        log_prob_norm : array, shape (n_samples,)
-            log p(X)
-
-        log_responsibilities : array, shape (n_samples, n_components)
-            logarithm of the responsibilities
+        Identical numerically to the reference implementation but
+        * avoids an extra (n_samples, n_components) temporary
+        * uses a single `logsumexp` call with `keepdims=True`
+        * keeps memory traffic low by updating in-place.
         """
-        weighted_log_prob = self._estimate_weighted_log_prob(X)
-        log_prob_norm = logsumexp(weighted_log_prob, axis=1)
+        # 1. log p(x | k)  +  log π_k
+        log_prob = self._estimate_log_prob(X)              # (n, k)
+        log_prob += self._estimate_log_weights()           # in-place add
+
+        # 2. log p(x) and log responsibilities
+        log_prob_norm = logsumexp(log_prob, axis=1, keepdims=True)  # (n, 1)
         with np.errstate(under="ignore"):
-            # ignore underflow
-            log_resp = weighted_log_prob - log_prob_norm[:, np.newaxis]
-        return log_prob_norm, log_resp
+            log_resp = log_prob - log_prob_norm            # broadcast subtract
+
+        # caller expects 1-D array for log p(x)
+        return log_prob_norm.ravel(), log_resp
 
     def _print_verbose_msg_init_beg(self, n_init):
         """Print verbose message on initialization."""

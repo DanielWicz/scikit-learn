@@ -552,7 +552,7 @@ def _compute_quadratic_form_tied(X_prec, mu_prec):
 
 
 def _estimate_log_gaussian_prob(
-    X, means, precisions_chol, covariance_type, *, _loop_thr=4, _vec_thr=10
+    X, means, precisions_chol, covariance_type, *, _loop_thr=4, _vec_thr=1000000
 ):
     """Vectorised & parallel log Gaussian probability.
 
@@ -634,18 +634,18 @@ def _estimate_log_gaussian_prob(
             + (X ** 2) @ precisions.T
         )
         return -0.5 * (n_features * np.log(2.0 * np.pi) + log_prob) + log_det
-
-    # ------------------------------------------------------------------ #
-    # SPHERICAL covariance                                               #
-    # ------------------------------------------------------------------ #
-    precisions = precisions_chol ** 2
-    x2 = row_norms(X, squared=True)                       # (n,)
-    mu2 = row_norms(means, squared=True)                  # (k,)
-    log_prob = (
-        mu2[None, :] * precisions
-        - 2.0 * (X @ means.T) * precisions
-        + x2[:, None] * precisions
-    )
+    if covariance_type  == "spherical":
+        # ------------------------------------------------------------------ #
+        # SPHERICAL covariance                                               #
+        # ------------------------------------------------------------------ #
+        precisions = precisions_chol ** 2
+        x2 = row_norms(X, squared=True)                       # (n,)
+        mu2 = row_norms(means, squared=True)                  # (k,)
+        log_prob = (
+            mu2[None, :] * precisions
+            - 2.0 * (X @ means.T) * precisions
+            + x2[:, None] * precisions
+        )
     return -0.5 * (n_features * np.log(2.0 * np.pi) + log_prob) + log_det
 
 
