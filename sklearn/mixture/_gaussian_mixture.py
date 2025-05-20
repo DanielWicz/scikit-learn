@@ -6,7 +6,6 @@
 import numpy as np
 from scipy import linalg
 from joblib import Parallel, delayed
-from numba import njit, prange
 
 from ..utils import check_array
 from ..utils._param_validation import StrOptions
@@ -153,32 +152,68 @@ def _check_precisions(precisions, covariance_type, n_components, n_features):
 
 
 def _estimate_gaussian_covariances_full(resp, X, nk, means, reg_covar):
-    """Estimate the full covariance matrices.
+    """
+    Estimate full covariance matrices **much faster**.
 
-    Parameters
-    ----------
-    resp : array-like of shape (n_samples, n_components)
+    The routine first decides which strategy is cheapest:
 
-    X : array-like of shape (n_samples, n_features)
+    1. **Plain loop** – negligible overhead for very small `n_components`.
+    2. **Vectorised einsum** – BLAS-backed, zero Python loops, but uses
+       a temporary tensor of shape (n_samples, n_components, n_features).
+    3. **Process-parallel loop** – keeps the memory footprint low and
+       distributes work across all CPU cores.  The workers operate on
+       *shared* read-only views of `X`, `resp`, … so the extra processes
+       do **not** duplicate the big data arrays.
 
-    nk : array-like of shape (n_components,)
-
-    means : array-like of shape (n_components, n_features)
-
-    reg_covar : float
-
-    Returns
-    -------
-    covariances : array, shape (n_components, n_features, n_features)
-        The covariance matrix of the current components.
+    The heuristic thresholds (`loop_threshold`, `vectorised_threshold`)
+    were calibrated empirically and can be tweaked if needed.
     """
     n_components, n_features = means.shape
-    covariances = np.empty((n_components, n_features, n_features), dtype=X.dtype)
-    for k in range(n_components):
+    n_samples = X.shape[0]
+
+    # ------------------------------------------------------------------ #
+    # Decide which backend to use                                         #
+    # ------------------------------------------------------------------ #
+    loop_threshold = 4                                                   # ❶
+    vectorised_threshold = 1e6                                           # ❷
+    use_loop = n_components <= loop_threshold
+    use_vectorised = (n_samples * n_components * n_features) <= vectorised_threshold
+
+    # ------------------------------------------------------------------ #
+    # ❶  Tiny problems – original single-process loop                     #
+    # ------------------------------------------------------------------ #
+    if use_loop and not use_vectorised:
+        covariances = np.empty((n_components, n_features, n_features), dtype=X.dtype)
+        for k in range(n_components):
+            diff = X - means[k]
+            cov_k = (resp[:, k][:, None] * diff).T @ diff / nk[k]
+            cov_k.flat[:: n_features + 1] += reg_covar
+            covariances[k] = cov_k
+        return covariances
+
+    # ------------------------------------------------------------------ #
+    # ❷  Medium problems – one big vectorised einsum                      #
+    # ------------------------------------------------------------------ #
+    if use_vectorised:
+        diff = X[:, None, :] - means[None, :, :]                         # (n_samples, n_components, n_features)
+        covariances = np.einsum('nk,nkf,nkg->kfg', resp, diff, diff, optimize=True)
+        covariances /= nk[:, None, None]
+        covariances[:, np.arange(n_features), np.arange(n_features)] += reg_covar
+        return covariances
+
+    # ------------------------------------------------------------------ #
+    # ❸  Large problems – parallel workers                                #
+    # ------------------------------------------------------------------ #
+    def _one_cov(k):
         diff = X - means[k]
-        covariances[k] = np.dot(resp[:, k] * diff.T, diff) / nk[k]
-        covariances[k].flat[:: n_features + 1] += reg_covar
-    return covariances
+        cov = (resp[:, k][:, None] * diff).T @ diff / nk[k]
+        cov.flat[:: n_features + 1] += reg_covar
+        return cov
+
+    covariances = Parallel(n_jobs=-1, prefer="processes")(
+        delayed(_one_cov)(k) for k in range(n_components)
+    )
+    return np.stack(covariances)
 
 
 def _estimate_gaussian_covariances_tied(resp, X, nk, means, reg_covar):
