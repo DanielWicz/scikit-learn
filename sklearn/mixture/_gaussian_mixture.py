@@ -332,50 +332,100 @@ def _estimate_gaussian_parameters(X, resp, reg_covar, covariance_type):
     return nk, means, covariances
 
 
-def _compute_precision_cholesky(covariances, covariance_type):
-    """
-    Compute the Cholesky decomposition of precision matrices.
+###############################################################################
+# Robust, version-agnostic batched precision-Cholesky
+###############################################################################
+from scipy import linalg
+import numpy as np
 
-    For 'full', factorizes and inverts each covariance in parallel
-    to exploit multiple CPU cores. Falls back to sequential for other types.
+def _compute_precision_cholesky(covariances, covariance_type, *, _tiny_kd=32):
+    """
+    Compute upper-triangular precision-Cholesky factors.
+
+    Works with any SciPy / NumPy version and optionally PyTorch.
+
+    Parameters
+    ----------
+    covariances : ndarray
+        For ``covariance_type='full'`` – shape (k, d, d).
+
+    covariance_type : {'full', 'tied', 'diag', 'spherical'}
+
+    Returns
+    -------
+    precisions_chol : ndarray
+        Same semantics as scikit-learn’s original helper.
     """
     dtype = covariances.dtype
-    # Shared error message
     err_msg = (
         "Fitting failed: ill-defined empirical covariance. "
         "Try fewer components, larger reg_covar, or float64 inputs."
     )
 
-    if covariance_type == "full":
-        n_components, n_features, _ = covariances.shape
-
-        def _process(cov):
-            # Factor and invert
+    # ------------------------------------------------------------------ #
+    # Fast paths for non-FULL cases (unchanged)                           #
+    # ------------------------------------------------------------------ #
+    if covariance_type != "full":
+        if covariance_type == "tied":
             try:
-                L = linalg.cholesky(cov, lower=True)
+                L = linalg.cholesky(covariances, lower=True)
             except linalg.LinAlgError:
                 raise ValueError(err_msg)
-            # Solve L * U = I  =>  U = L^{-1}
-            return linalg.solve_triangular(L, np.eye(n_features, dtype=dtype), lower=True).T
+            return linalg.solve_triangular(
+                L, np.eye(L.shape[0], dtype=dtype), lower=True
+            ).T
+        else:  # diag / spherical
+            if np.any(covariances <= 0.0):
+                raise ValueError(err_msg)
+            return 1.0 / np.sqrt(covariances)
 
-        # Parallel over components
-        precisions_chol = Parallel(n_jobs=-1)(
-            delayed(_process)(cov) for cov in covariances
-        )
-        return np.stack(precisions_chol)
+    # ------------------------------------------------------------------ #
+    # FULL covariance ‒ choose the cheapest backend                       #
+    # ------------------------------------------------------------------ #
+    n_components, n_features, _ = covariances.shape
 
-    elif covariance_type == "tied":
+    # ❶ tiny batches – keep the simple reference loop
+    if n_components * n_features <= _tiny_kd:
+        chol = []
+        for k in range(n_components):
+            try:
+                L = linalg.cholesky(covariances[k], lower=True)
+            except linalg.LinAlgError:
+                raise ValueError(err_msg)
+            U = linalg.solve_triangular(
+                L, np.eye(n_features, dtype=dtype), lower=True
+            ).T                        # upper-triangular
+            chol.append(U)
+        return np.stack(chol, axis=0)
+
+    # ❷ try SciPy batched (SciPy ≥ 1.9)
+    try:
+        L = linalg.cholesky(covariances, lower=True)           # (k, d, d)
+        U = np.linalg.inv(L).transpose(0, 2, 1)               # upper-tri
+        return U
+    except ValueError as exc:
+        if "needs to be 2D" not in str(exc):
+            raise      # covariance not SPD – keep the original error path
+        # else: SciPy is too old → fall through to NumPy
+    except linalg.LinAlgError:
+        raise ValueError(err_msg)
+
+    # ❸ NumPy fallback (always supports batching, returns UPPER factor)
+    try:
+        U_upper = np.linalg.cholesky(covariances)              # (k, d, d)
+        U_prec  = np.linalg.inv(U_upper)                       # upper-tri
+        return U_prec
+    except np.linalg.LinAlgError:
+        # ❹ optional PyTorch fallback
         try:
-            L = linalg.cholesky(covariances, lower=True)
-        except linalg.LinAlgError:
-            raise ValueError(err_msg)
-        return linalg.solve_triangular(L, np.eye(L.shape[0], dtype=dtype), lower=True).T
+            import torch
+            tensor = torch.as_tensor(covariances)
+            L_torch = torch.linalg.cholesky(tensor, upper=False)      # lower
+            U = torch.linalg.inv(L_torch).transpose(-2, -1).cpu().numpy()
+            return U.astype(dtype, copy=False)
+        except (ImportError, RuntimeError, torch.linalg.LinAlgError):
+            raise ValueError(err_msg) from None
 
-    else:
-        # diag or spherical
-        if np.any(covariances <= 0.0):
-            raise ValueError(err_msg)
-        return 1.0 / np.sqrt(covariances)
 
 
 def _flipudlr(array):
@@ -507,7 +557,7 @@ def _compute_quadratic_form_tied(X_prec, mu_prec):
 
 
 def _estimate_log_gaussian_prob(
-    X, means, precisions_chol, covariance_type, *, _loop_thr=4, _vec_thr=1_000_000
+    X, means, precisions_chol, covariance_type, *, _loop_thr=4, _vec_thr=10
 ):
     """Vectorised & parallel log Gaussian probability.
 
