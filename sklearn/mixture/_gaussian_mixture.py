@@ -484,43 +484,38 @@ def _compute_precision_cholesky_from_precisions(precisions, covariance_type):
 
 
 ###############################################################################
-# Gaussian mixture probability estimators
+# Faster (and simpler) log-det computation
+###############################################################################
 def _compute_log_det_cholesky(matrix_chol, covariance_type, n_features):
-    """Compute the log-det of the cholesky decomposition of matrices.
+    """Return log-|precision_chol| for each component.
 
     Parameters
     ----------
-    matrix_chol : array-like
-        Cholesky decompositions of the matrices.
-        'full' : shape of (n_components, n_features, n_features)
-        'tied' : shape of (n_features, n_features)
-        'diag' : shape of (n_components, n_features)
-        'spherical' : shape of (n_components,)
-
+    matrix_chol : ndarray
+        Cholesky factors – see original doc-string.
     covariance_type : {'full', 'tied', 'diag', 'spherical'}
-
     n_features : int
-        Number of features.
 
     Returns
     -------
-    log_det_precision_chol : array-like of shape (n_components,)
-        The determinant of the precision matrix for each component.
+    log_det_precision_chol : ndarray or scalar
+        * shape (n_components,) for 'full', 'diag', 'spherical'
+        * scalar for 'tied'  (broadcasted by the caller)
     """
     if covariance_type == "full":
-        n_components, _, _ = matrix_chol.shape
-        log_det_chol = np.sum(
-            np.log(matrix_chol.reshape(n_components, -1)[:, :: n_features + 1]), axis=1
-        )
+        # diagonal view – shape (k, d), no data copy
+        diag = np.diagonal(matrix_chol, axis1=-2, axis2=-1)
+        log_det_chol = np.log(diag).sum(axis=1)            # (k,)
 
     elif covariance_type == "tied":
-        log_det_chol = np.sum(np.log(np.diag(matrix_chol)))
+        # scalar; the caller relies on numpy broadcasting
+        log_det_chol = np.log(np.diagonal(matrix_chol)).sum()
 
     elif covariance_type == "diag":
-        log_det_chol = np.sum(np.log(matrix_chol), axis=1)
+        log_det_chol = np.log(matrix_chol).sum(axis=1)      # (k,)
 
-    else:
-        log_det_chol = n_features * np.log(matrix_chol)
+    else:  # 'spherical'
+        log_det_chol = n_features * np.log(matrix_chol)     # (k,)
 
     return log_det_chol
 
