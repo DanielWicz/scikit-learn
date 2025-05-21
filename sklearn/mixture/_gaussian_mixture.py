@@ -13,6 +13,7 @@ try:
     import jax.numpy as jnp
 except:
     pass
+
 from ..utils._param_validation import StrOptions
 from ..utils.extmath import row_norms
 from ._base import BaseMixture, _check_shape
@@ -77,14 +78,14 @@ def _available_ram():
 
 @lru_cache(maxsize=1)
 def _select_vectorised(n_samples: int, n_components: int, n_features: int,
-                       dtype=np.float64, safety: float = 0.5) -> bool:
+                       dtype=np.float64, safety: float = 0.95) -> bool:
     """Decide whether the huge einsum tensor fits in RAM."""
     bytes_needed = (n_samples * n_components * n_features *
                     np.dtype(dtype).itemsize)
     return (bytes_needed/(1024**2)) < _available_ram() * safety
 
 @lru_cache(maxsize=1)
-def _fits_in_memory(n_bytes, safety=0.5):
+def _fits_in_memory(n_bytes, safety=0.95):
     """
     Heuristic test whether allocating ``n_bytes`` is safe based on cached available RAM.
 
@@ -92,8 +93,8 @@ def _fits_in_memory(n_bytes, safety=0.5):
     ----------
     n_bytes : int
         Candidate allocation size in **bytes**.
-    safety : float, default=0.5
-        Fraction of the free memory to leave untouched (e.g. 0.5 = use up to 50% of free RAM).
+    safety : float, default=0.95
+        Fraction of the free memory to leave untouched (e.g. 0.95 = use up to 95% of free RAM).
 
     Returns
     -------
@@ -113,7 +114,7 @@ def _optimal_chunk_size(
     n_samples: int,
     n_features: int,
     dtype: np.dtype = np.float64,
-    safety: float = 0.5,
+    safety: float = 0.90,
 ) -> int:
     """
     Return the largest number of mixture *components* that can be processed in
@@ -269,70 +270,79 @@ def _check_precisions(precisions, covariance_type, n_components, n_features):
 # Gaussian mixture parameters estimators (used by the M-Step)
 def _estimate_gaussian_covariances_full(resp, X, nk, means, reg_covar):
     """
-    Estimate full covariance matrices without joblib or threadpool limits,
+    Estimate full covariance matrices with minimal memory copies,
     using batched np.matmul (multi-threaded BLAS).
 
-    Strategy
-    --------
-    1. Tiny problems → simple Python loop (cheap overhead).
-    2. Fits RAM      → one batched matmul for all components.
-    3. Too large     → split components into the fewest RAM-safe chunks,
-                       each done with a batched matmul.
+    We precompute 3 broadcast views:
+      X_b     = X[:, None, :]       # (n_samples, 1,  n_features)
+      means_b = means[None, :, :]   # (1,       n_components, n_features)
+      resp_b  = resp[:, :, None]    # (n_samples, n_components, 1)
+
+    Then diff_b   = X_b - means_b  # view broadcast subtraction
+        weighted = diff_b * resp_b  # elementwise weighting
+    Finally cov = matmul(diff_b.T @ weighted)
     """
     n_components, n_features = means.shape
     n_samples = X.shape[0]
     dtype = X.dtype
 
-    # 1) tiny: plain loop
+    # broadcast views
+    X_b     = X[:, None, :]       # (n, 1,  d)
+    means_b = means[None, :, :]   # (1, k,  d)
+    resp_b  = resp[:, :, None]    # (n, k,  1)
+
+    # 1) tiny: pure Python loop
     LOOP_MAX_K = 4
     if n_components <= LOOP_MAX_K and not _select_vectorised(
         n_samples, n_components, n_features, dtype
     ):
         cov = np.empty((n_components, n_features, n_features), dtype=dtype)
         for k in range(n_components):
-            diff = X - means[k]                   # (n_samples, n_features)
-            weighted = diff * resp[:, k][:, None]  # (n_samples, n_features)
-            # BLAS-backed matmul
-            c_k = diff.T @ weighted / nk[k]
+            diff_k   = X - means[k]            # (n, d) – one small broadcast
+            weighted = diff_k * resp[:, k][:, None]
+            c_k      = diff_k.T @ weighted     # BLAS-backed
             c_k.flat[:: n_features + 1] += reg_covar
-            cov[k] = c_k
+            cov[k]   = c_k
         return cov
 
-    # Compute total bytes if we did all at once
+    # compute total bytes of the full diff array
     total_bytes = n_samples * n_components * n_features * dtype.itemsize
 
-    # 2) medium: one batched matmul if it fits
+    # 2) medium: all-in-one batched matmul
     if _fits_in_memory(total_bytes):
-        diff = X[:, None, :] - means[None, :, :]        # (n, k, d)
-        resp_diff = diff * resp[:, :, None]             # (n, k, d)
+        # one broadcast diff
+        diff_b   = X_b - means_b               # view, no copy of shape (n, k, d)
+        weighted = diff_b * resp_b            # (n, k, d)
 
-        # batch matmul: (k, f, n) @ (k, n, f)
+        # matmul: (k, d, n) @ (k, n, d) → (k, d, d)
+        # we only transpose the small precision dimension
         cov = np.matmul(
-            diff.transpose(1, 2, 0),    # (k, d, n)
-            resp_diff.transpose(1, 0, 2) # (k, n, d)
+            diff_b.transpose(1, 2, 0),        # (k, d, n)
+            weighted.transpose(1, 0, 2)       # (k, n, d)
         )
         cov /= nk[:, None, None]
         cov[:, np.arange(n_features), np.arange(n_features)] += reg_covar
         return cov
 
-    # 3) large: chunk into RAM-safe blocks
+    # 3) large: chunk into fewest RAM-safe blocks
     chunk_size = _optimal_chunk_size(n_samples, n_features, dtype)
     cov_chunks = []
     for start in range(0, n_components, chunk_size):
-        end = min(start + chunk_size, n_components)
-        diff_chunk = X[:, None, :] - means[start:end][None, :, :]         # (n, k_c, d)
-        resp_diff  = diff_chunk * resp[:, start:end][:, :, None]         # (n, k_c, d)
+        end     = min(start + chunk_size, n_components)
+        # slice views – still no copies yet
+        diff_chunk   = X_b - means_b[:, start:end, :]    # (n, k_c, d)
+        resp_chunk   = resp_b[:, start:end, :]           # (n, k_c, 1)
+        weighted_ch  = diff_chunk * resp_chunk           # (n, k_c, d)
 
-        cov_chunk = np.matmul(
-            diff_chunk.transpose(1, 2, 0),   # (k_c, d, n)
-            resp_diff.transpose(1, 0, 2),     # (k_c, n, d)
+        cov_ch = np.matmul(
+            diff_chunk.transpose(1, 2, 0),              # (k_c, d, n)
+            weighted_ch.transpose(1, 0, 2)               # (k_c, n, d)
         )
-        cov_chunk /= nk[start:end, None, None]
-        cov_chunk[:, np.arange(n_features), np.arange(n_features)] += reg_covar
-        cov_chunks.append(cov_chunk)
+        cov_ch /= nk[start:end, None, None]
+        cov_ch[:, np.arange(n_features), np.arange(n_features)] += reg_covar
+        cov_chunks.append(cov_ch)
 
     return np.concatenate(cov_chunks, axis=0)
-
 
 
 def _estimate_gaussian_covariances_tied(resp, X, nk, means, reg_covar):
