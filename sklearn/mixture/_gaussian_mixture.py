@@ -13,11 +13,9 @@ try:
     import jax.numpy as jnp
 except:
     pass
-
 from ..utils._param_validation import StrOptions
 from ..utils.extmath import row_norms
 from ._base import BaseMixture, _check_shape
-N_PROCESS_FIXED = -1
 ###############################################################################
 # Gaussian mixture shape checkers used by the GaussianMixture class
 
@@ -271,55 +269,69 @@ def _check_precisions(precisions, covariance_type, n_components, n_features):
 # Gaussian mixture parameters estimators (used by the M-Step)
 def _estimate_gaussian_covariances_full(resp, X, nk, means, reg_covar):
     """
-    Estimate full covariance matrices **without** joblib.
+    Estimate full covariance matrices without joblib or threadpool limits,
+    using batched np.matmul (multi-threaded BLAS).
 
     Strategy
     --------
-    1.  Tiny problems → simple Python loop (cheap, minimal overhead).
-    2.  Fits RAM       → single vectorised einsum (fastest).
-    3.  Too large      → split the components into the *fewest* chunks that
-        fit RAM, run the same einsum per chunk, and concatenate.
+    1. Tiny problems → simple Python loop (cheap overhead).
+    2. Fits RAM      → one batched matmul for all components.
+    3. Too large     → split components into the fewest RAM-safe chunks,
+                       each done with a batched matmul.
     """
     n_components, n_features = means.shape
     n_samples = X.shape[0]
     dtype = X.dtype
 
+    # 1) tiny: plain loop
     LOOP_MAX_K = 4
     if n_components <= LOOP_MAX_K and not _select_vectorised(
         n_samples, n_components, n_features, dtype
     ):
-        # ---------- tiny: plain loop -----------------------------------
         cov = np.empty((n_components, n_features, n_features), dtype=dtype)
         for k in range(n_components):
-            diff = X - means[k]
-            c_k = (resp[:, k][:, None] * diff).T @ diff / nk[k]
+            diff = X - means[k]                   # (n_samples, n_features)
+            weighted = diff * resp[:, k][:, None]  # (n_samples, n_features)
+            # BLAS-backed matmul
+            c_k = diff.T @ weighted / nk[k]
             c_k.flat[:: n_features + 1] += reg_covar
             cov[k] = c_k
         return cov
 
-    # ---------- one big einsum if it fits ------------------------------
-    if _select_vectorised(n_samples, n_components, n_features, dtype):
-        diff = X[:, None, :] - means[None, :, :]
-        cov = np.einsum("nk,nkf,nkg->kfg", resp, diff, diff, optimize=True)
+    # Compute total bytes if we did all at once
+    total_bytes = n_samples * n_components * n_features * dtype.itemsize
+
+    # 2) medium: one batched matmul if it fits
+    if _fits_in_memory(total_bytes):
+        diff = X[:, None, :] - means[None, :, :]        # (n, k, d)
+        resp_diff = diff * resp[:, :, None]             # (n, k, d)
+
+        # batch matmul: (k, f, n) @ (k, n, f)
+        cov = np.matmul(
+            diff.transpose(1, 2, 0),    # (k, d, n)
+            resp_diff.transpose(1, 0, 2) # (k, n, d)
+        )
         cov /= nk[:, None, None]
         cov[:, np.arange(n_features), np.arange(n_features)] += reg_covar
         return cov
 
-    # ---------- fallback: chunk along components -----------------------
+    # 3) large: chunk into RAM-safe blocks
     chunk_size = _optimal_chunk_size(n_samples, n_features, dtype)
     cov_chunks = []
     for start in range(0, n_components, chunk_size):
         end = min(start + chunk_size, n_components)
-        diff = X[:, None, :] - means[start:end][None, :, :]
-        cov_chunk = np.einsum(
-            "nk,nkf,nkg->kfg", resp[:, start:end], diff, diff, optimize=True
+        diff_chunk = X[:, None, :] - means[start:end][None, :, :]         # (n, k_c, d)
+        resp_diff  = diff_chunk * resp[:, start:end][:, :, None]         # (n, k_c, d)
+
+        cov_chunk = np.matmul(
+            diff_chunk.transpose(1, 2, 0),   # (k_c, d, n)
+            resp_diff.transpose(1, 0, 2),     # (k_c, n, d)
         )
         cov_chunk /= nk[start:end, None, None]
         cov_chunk[:, np.arange(n_features), np.arange(n_features)] += reg_covar
         cov_chunks.append(cov_chunk)
 
     return np.concatenate(cov_chunks, axis=0)
-
 
 
 
@@ -656,80 +668,85 @@ def _estimate_log_gaussian_prob(
     X, means, precisions_chol, covariance_type, *, _loop_thr=4
 ):
     """
-    Compute the per-sample per-component log-probability of a Gaussian.
+    Compute per-sample per-component log-probabilities for a Gaussian.
 
-    The *'full'*-covariance path has been rewritten to eliminate joblib.  If
-    the full n×k×d tensor would not fit into RAM, we iterate over the
-    *fewest* component-chunks that do.
+    The 'full' covariance path now uses batched np.matmul instead of einsum:
+      - proj_X = batch_prec @ X.T  → transpose → (n_samples, n_components, n_features)
+      - proj_mu = batch_prec @ means[..., None] → squeeze → (n_components, n_features)
+
+    If the full tensor doesn’t fit in RAM, we split into the fewest
+    RAM-safe component‐chunks and apply the same batched matmul logic.
     """
     n_samples, n_features = X.shape
     n_components, _ = means.shape
-    log_det = _compute_log_det_cholesky(precisions_chol, covariance_type, n_features)
+
+    log_det = _compute_log_det_cholesky(
+        precisions_chol, covariance_type, n_features
+    )
     log2pi = n_features * np.log(2.0 * np.pi)
 
-    # ------------------------------------------------------------------ #
-    # FULL covariance                                                    #
-    # ------------------------------------------------------------------ #
     if covariance_type == "full":
-        if n_components <= _loop_thr and not _fits_in_memory(
-            n_samples * n_components * n_features * X.dtype.itemsize
-        ):
-            # ---- tiny: keep the simple loop ---------------------------
+        # total bytes for full tensor of shape (n_samples, n_components, n_features)
+        total_bytes = n_samples * n_components * n_features * X.dtype.itemsize
+
+        # ❶ tiny: direct Python loop
+        if n_components <= _loop_thr and not _fits_in_memory(total_bytes):
             log_quad = np.empty((n_samples, n_components), dtype=X.dtype)
-            for k, (mu, prec_chol) in enumerate(zip(means, precisions_chol)):
-                y = X @ prec_chol - mu @ prec_chol
+            for k, (mu, prec) in enumerate(zip(means, precisions_chol)):
+                y = X @ prec - mu @ prec
                 log_quad[:, k] = np.square(y).sum(axis=1)
             return -0.5 * (log2pi + log_quad) + log_det
 
-        if _fits_in_memory(n_samples * n_components * n_features * X.dtype.itemsize):
-            # ---- fits RAM: one vectorised shot ------------------------
-            stacked = np.vstack([X, means])                       # (n + k, d)
-            proj = np.einsum("md,kdf->mkf", stacked, precisions_chol, optimize=True)
-            proj_X = proj[:n_samples]                              # (n, k, d)
-            proj_mu = proj[n_samples + np.arange(n_components), np.arange(n_components)]
-            log_quad = np.square(proj_X - proj_mu[None, :, :]).sum(axis=2)
+        # ❷ medium: all‐in‐one batched matmul if it fits
+        if _fits_in_memory(total_bytes):
+            # proj_X: (n_components, n_features, n_samples) → transpose to (n_samples, n_components, n_features)
+            proj_X = np.matmul(
+                precisions_chol, X.T
+            ).transpose(2, 0, 1)
+            # proj_mu: (n_components, n_features, 1) → squeeze to (n_components, n_features)
+            proj_mu = np.matmul(
+                precisions_chol, means[:, :, None]
+            ).squeeze(-1)
+            # compute quad
+            diff = proj_X - proj_mu[None, :, :]
+            log_quad = np.square(diff).sum(axis=2)
             return -0.5 * (log2pi + log_quad) + log_det
 
-        # ---- large: iterate over the smallest RAM-safe chunks ---------
+        # ❸ large: chunk into RAM-safe blocks
         chunk_size = _optimal_chunk_size(n_samples, n_features, X.dtype)
         log_quad = np.empty((n_samples, n_components), dtype=X.dtype)
 
         for start in range(0, n_components, chunk_size):
             end = min(start + chunk_size, n_components)
-            prec_chunk = precisions_chol[start:end]          # (k_c, d, d)
-            mu_chunk   = means[start:end]                    # (k_c, d)
-            k_chunk    = end - start
+            prec_chunk = precisions_chol[start:end]     # (k_c, f, f)
+            mu_chunk = means[start:end]                # (k_c, f)
+            k_c = end - start
 
-            # -----------------------------------------------------------
-            # Prefer the *single-einsum* path if it still fits in RAM;
-            # fall back to the two-einsum variant otherwise.
-            # -----------------------------------------------------------
-            tmp_bytes = (n_samples + k_chunk) * k_chunk * n_features * X.dtype.itemsize
-            if _fits_in_memory(tmp_bytes):
-                # one big contraction → project X and μ at once
-                stacked = np.vstack([X, mu_chunk])           # (n + k_c, d)
-                proj = np.einsum("md,kdf->mkf", stacked, prec_chunk, optimize=True)
-                proj_X  = proj[:n_samples]                   # (n, k_c, d)
-                proj_mu = proj[n_samples + np.arange(k_chunk), np.arange(k_chunk)]
-            else:
-                # memory-lean two-einsum fallback
-                proj_X  = np.einsum("nd,kdf->nkf", X,       prec_chunk, optimize=True)
-                proj_mu = np.einsum("kd,kdf->kf",  mu_chunk, prec_chunk, optimize=True)
+            # batched matmul for this slice
+            proj_X_chunk = np.matmul(
+                prec_chunk, X.T
+            ).transpose(2, 0, 1)                       # (n, k_c, f)
+            proj_mu_chunk = np.matmul(
+                prec_chunk, mu_chunk[:, :, None]
+            ).squeeze(-1)                               # (k_c, f)
 
-            # quadratic form for this slice of components
-            log_quad[:, start:end] = np.square(proj_X - proj_mu[None, :, :]).sum(axis=2)
+            diff = proj_X_chunk - proj_mu_chunk[None, :, :]
+            log_quad[:, start:end] = np.square(diff).sum(axis=2)
 
         return -0.5 * (log2pi + log_quad) + log_det
 
-    # ------------------------------------------------------------------ #
-    # All other covariance types – unchanged (vectorised already).       #
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
+    # TIED covariance – unchanged
+    # ------------------------------------------------------------------
     if covariance_type == "tied":
         X_prec = X @ precisions_chol
         mu_prec = means @ precisions_chol
         quad = _compute_quadratic_form_tied(X_prec, mu_prec)
         return -0.5 * (log2pi + quad) + log_det
 
+    # ------------------------------------------------------------------
+    # DIAG covariance – unchanged
+    # ------------------------------------------------------------------
     if covariance_type == "diag":
         precisions = precisions_chol ** 2
         quad = (
@@ -739,12 +756,19 @@ def _estimate_log_gaussian_prob(
         )
         return -0.5 * (log2pi + quad) + log_det
 
-    # spherical
+    # ------------------------------------------------------------------
+    # SPHERICAL covariance – unchanged
+    # ------------------------------------------------------------------
     precisions = precisions_chol ** 2
     x2 = row_norms(X, squared=True)
     mu2 = row_norms(means, squared=True)
-    quad = mu2[None, :] * precisions - 2 * (X @ means.T) * precisions + x2[:, None] * precisions
+    quad = (
+        mu2[None, :] * precisions
+        - 2 * (X @ means.T) * precisions
+        + x2[:, None] * precisions
+    )
     return -0.5 * (log2pi + quad) + log_det
+
 
 
 class GaussianMixture(BaseMixture):
