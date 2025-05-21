@@ -77,14 +77,14 @@ def _available_ram():
 
 @lru_cache(maxsize=1)
 def _select_vectorised(n_samples: int, n_components: int, n_features: int,
-                       dtype=np.float64, safety: float = 0.95) -> bool:
+                       dtype=np.float64, safety: float = 0.5) -> bool:
     """Decide whether the huge einsum tensor fits in RAM."""
     bytes_needed = (n_samples * n_components * n_features *
                     np.dtype(dtype).itemsize)
     return (bytes_needed/(1024**2)) < _available_ram() * safety
 
 @lru_cache(maxsize=1)
-def _fits_in_memory(n_bytes, safety=0.95):
+def _fits_in_memory(n_bytes, safety=0.5):
     """
     Heuristic test whether allocating ``n_bytes`` is safe based on cached available RAM.
 
@@ -92,8 +92,8 @@ def _fits_in_memory(n_bytes, safety=0.95):
     ----------
     n_bytes : int
         Candidate allocation size in **bytes**.
-    safety : float, default=0.95
-        Fraction of the free memory to leave untouched (e.g. 0.95 = use up to 95% of free RAM).
+    safety : float, default=0.5
+        Fraction of the free memory to leave untouched (e.g. 0.5 = use up to 50% of free RAM).
 
     Returns
     -------
@@ -113,7 +113,7 @@ def _optimal_chunk_size(
     n_samples: int,
     n_features: int,
     dtype: np.dtype = np.float64,
-    safety: float = 0.90,
+    safety: float = 0.5,
 ) -> int:
     """
     Return the largest number of mixture *components* that can be processed in
