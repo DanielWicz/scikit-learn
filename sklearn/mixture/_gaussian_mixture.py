@@ -85,7 +85,7 @@ def _select_vectorised(n_samples: int, n_components: int, n_features: int,
     return (bytes_needed/(1024**2)) < _available_ram() * safety
 
 @lru_cache(maxsize=1)
-def _fits_in_memory(n_bytes, safety=0.5):
+def _fits_in_memory(n_bytes, safety=0.25):
     """
     Heuristic test whether allocating ``n_bytes`` is safe based on cached available RAM.
 
