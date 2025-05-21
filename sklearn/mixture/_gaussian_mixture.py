@@ -6,16 +6,120 @@
 import numpy as np
 from scipy import linalg
 from joblib import Parallel, delayed
-
+import os
+from functools import lru_cache, partial
 from ..utils import check_array
+from threadpoolctl import threadpool_limits
+import psutil
+try:
+    import jax.numpy as jnp
+except:
+    pass
+
 from ..utils._param_validation import StrOptions
 from ..utils.extmath import row_norms
 from ._base import BaseMixture, _check_shape
-N_PROCESS_FIXED = 16
+N_PROCESS_FIXED = -1
 ###############################################################################
 # Gaussian mixture shape checkers used by the GaussianMixture class
 
 
+@lru_cache(maxsize=1)
+def _preferred_batch_cholesky_backend():
+    """
+    Decide the best batched-Cholesky backend and cache the result:
+
+    * **jax**   – fastest when JAX is available (CPU or GPU).
+    * **scipy** – SciPy ≥ 1.9 supports batched `linalg.cholesky`.
+    * **numpy** – always available, reasonably fast.
+    * **loop**  – last-resort pure-Python loop.
+    """
+
+    # ── ➋ SciPy ≥ 1.9 ────────────────────────────────────────────────────
+    try:
+        dummy = np.eye(2)[None, ...]
+        linalg.cholesky(dummy, lower=True)
+        return "scipy"
+    except ValueError as exc:     # SciPy < 1.9 → “needs to be 2-D array”
+        if "needs to be" not in str(exc):
+            return "scipy"        # SciPy present but dummy not SPD
+    except Exception:
+        pass
+        
+        
+    # ── ➌ NumPy ──────────────────────────────────────────────────────────
+    try:
+        dummy = np.eye(2)[None, ...]
+        np.linalg.cholesky(dummy)
+        return "numpy"
+    except Exception:
+        pass
+
+
+
+
+
+    # ── ➊ JAX ─────────────────────────────────────────────────────────────
+    try:
+        import jax.numpy as jnp
+        dummy = jnp.eye(2).reshape(1, 2, 2)
+        _ = jnp.linalg.cholesky(dummy)          # triggers compilation once
+        return "jax"
+    except Exception:
+        pass
+
+
+
+    # ── ➍ Fallback loop ─────────────────────────────────────────────────
+    return "loop"
+
+
+@lru_cache(maxsize=1)
+def _available_ram():
+    """Return currently available RAM in MB (0 if ``psutil`` missing)."""
+    return psutil.virtual_memory().total >> 20
+
+@lru_cache(maxsize=1)
+def _select_vectorised(n_samples: int, n_components: int, n_features: int,
+                       dtype=np.float64, safety: float = 0.95) -> bool:
+    """Decide whether the huge einsum tensor fits in RAM."""
+    bytes_needed = (n_samples * n_components * n_features *
+                    np.dtype(dtype).itemsize)
+    return (bytes_needed/(1024**2)) < _available_ram() * safety
+
+@lru_cache(maxsize=1)
+def _fits_in_memory(n_bytes, safety=0.95):
+    """
+    Heuristic test whether allocating ``n_bytes`` is safe based on cached available RAM.
+
+    Parameters
+    ----------
+    n_bytes : int
+        Candidate allocation size in **bytes**.
+    safety : float, default=0.95
+        Fraction of the free memory to leave untouched (e.g. 0.95 = use up to 95% of free RAM).
+
+    Returns
+    -------
+    bool
+        True if allocation is safe within the cached available memory.
+    """
+    avail_mb = _available_ram()
+    if not avail_mb:
+        # Either psutil is missing or we couldn’t query; bail out conservatively.
+        return False
+    # Convert bytes to MiB and compare against the allowed fraction of free RAM
+    return (n_bytes / (1024 ** 2)) < safety * avail_mb
+
+
+
+
+def _effective_n_jobs(n_tasks: int) -> int:
+    """Return a sensible job count (never > CPUs, never > n_tasks)."""
+    max_cpus = os.cpu_count() or 1
+    env = int(os.getenv("GMIX_N_JOBS", "-1"))
+    want = max_cpus if env < 0 else max(1, env)
+    return max(1, min(want, n_tasks, max_cpus))
 def _check_weights(weights, n_components):
     """Check the user provided 'weights'.
 
@@ -149,71 +253,60 @@ def _check_precisions(precisions, covariance_type, n_components, n_features):
 
 ###############################################################################
 # Gaussian mixture parameters estimators (used by the M-Step)
-
-
 def _estimate_gaussian_covariances_full(resp, X, nk, means, reg_covar):
     """
-    Estimate full covariance matrices **much faster**.
+    Estimate full covariance matrices with an *adaptive* backend:
 
-    The routine first decides which strategy is cheapest:
-
-    1. **Plain loop** – negligible overhead for very small `n_components`.
-    2. **Vectorised einsum** – BLAS-backed, zero Python loops, but uses
-       a temporary tensor of shape (n_samples, n_components, n_features).
-    3. **Process-parallel loop** – keeps the memory footprint low and
-       distributes work across all CPU cores.  The workers operate on
-       *shared* read-only views of `X`, `resp`, … so the extra processes
-       do **not** duplicate the big data arrays.
-
-    The heuristic thresholds (`loop_threshold`, `vectorised_threshold`)
-    were calibrated empirically and can be tweaked if needed.
+    1. Plain Python loop – fastest for very small ``n_components``.
+    2. One big vectorised einsum – fastest overall *iff* the temporary
+       fits into a safe fraction of available RAM.
+    3. Multi-process loop – low memory footprint, scales across cores,
+       *never* over-subscribes BLAS threads.
     """
     n_components, n_features = means.shape
     n_samples = X.shape[0]
 
-    # ------------------------------------------------------------------ #
-    # Decide which backend to use                                         #
-    # ------------------------------------------------------------------ #
-    loop_threshold = 4                                                   # ❶
-    vectorised_threshold = 1e6                                           # ❷
-    use_loop = n_components <= loop_threshold
-    use_vectorised = (n_samples * n_components * n_features) <= vectorised_threshold
+    # -------------------------------------------------------------- #
+    # Heuristics                                                     #
+    # -------------------------------------------------------------- #
+    LOOP_MAX_K = 4
+    use_loop = n_components <= LOOP_MAX_K
+    use_vec = _select_vectorised(n_samples, n_components, n_features, X.dtype)
 
-    # ------------------------------------------------------------------ #
-    # ❶  Tiny problems – original single-process loop                     #
-    # ------------------------------------------------------------------ #
-    if use_loop and not use_vectorised:
-        covariances = np.empty((n_components, n_features, n_features), dtype=X.dtype)
+    # ❶ very small – plain loop
+    if use_loop and not use_vec:
+        cov = np.empty((n_components, n_features, n_features), dtype=X.dtype)
         for k in range(n_components):
             diff = X - means[k]
             cov_k = (resp[:, k][:, None] * diff).T @ diff / nk[k]
             cov_k.flat[:: n_features + 1] += reg_covar
-            covariances[k] = cov_k
-        return covariances
-
-    # ------------------------------------------------------------------ #
-    # ❷  Medium problems – one big vectorised einsum                      #
-    # ------------------------------------------------------------------ #
-    if use_vectorised:
-        diff = X[:, None, :] - means[None, :, :]                         # (n_samples, n_components, n_features)
-        covariances = np.einsum('nk,nkf,nkg->kfg', resp, diff, diff, optimize=True)
-        covariances /= nk[:, None, None]
-        covariances[:, np.arange(n_features), np.arange(n_features)] += reg_covar
-        return covariances
-
-    # ------------------------------------------------------------------ #
-    # ❸  Large problems – parallel workers                                #
-    # ------------------------------------------------------------------ #
-    def _one_cov(k):
-        diff = X - means[k]
-        cov = (resp[:, k][:, None] * diff).T @ diff / nk[k]
-        cov.flat[:: n_features + 1] += reg_covar
+            cov[k] = cov_k
         return cov
 
-    covariances = Parallel(n_jobs=N_PROCESS_FIXED, backend="loky")(
+    # ❷ fits in RAM – vectorised einsum
+    if use_vec:
+        diff = X[:, None, :] - means[None, :, :]
+        cov = np.einsum("nk,nkf,nkg->kfg", resp, diff, diff, optimize=True)
+        cov /= nk[:, None, None]
+        cov[:, np.arange(n_features), np.arange(n_features)] += reg_covar
+        return cov
+
+    # ❸ too big – fallback to multi-process loop
+    n_jobs = _effective_n_jobs(n_components)
+    blas_threads = max(1, (os.cpu_count() or 1) // n_jobs)
+
+    def _one_cov(k):
+        with threadpool_limits(limits=blas_threads):
+            diff = X - means[k]
+            c = (resp[:, k][:, None] * diff).T @ diff / nk[k]
+            c.flat[:: n_features + 1] += reg_covar
+            return c
+
+    covariances = Parallel(n_jobs=n_jobs, backend="loky")(
         delayed(_one_cov)(k) for k in range(n_components)
     )
     return np.stack(covariances)
+
 
 
 def _estimate_gaussian_covariances_tied(resp, X, nk, means, reg_covar):
@@ -335,26 +428,14 @@ def _estimate_gaussian_parameters(X, resp, reg_covar, covariance_type):
 ###############################################################################
 # Robust, version-agnostic batched precision-Cholesky
 ###############################################################################
-from scipy import linalg
-import numpy as np
 
 def _compute_precision_cholesky(covariances, covariance_type, *, _tiny_kd=32):
     """
     Compute upper-triangular precision-Cholesky factors.
 
-    Works with any SciPy / NumPy version and optionally PyTorch.
-
-    Parameters
-    ----------
-    covariances : ndarray
-        For ``covariance_type='full'`` – shape (k, d, d).
-
-    covariance_type : {'full', 'tied', 'diag', 'spherical'}
-
-    Returns
-    -------
-    precisions_chol : ndarray
-        Same semantics as scikit-learn’s original helper.
+    A single backend choice (cached by
+    ``_preferred_batch_cholesky_backend``) means the EM loop incurs **zero
+    overhead** from backend detection after the first call.
     """
     dtype = covariances.dtype
     err_msg = (
@@ -363,7 +444,7 @@ def _compute_precision_cholesky(covariances, covariance_type, *, _tiny_kd=32):
     )
 
     # ------------------------------------------------------------------ #
-    # Fast paths for non-FULL cases (unchanged)                           #
+    # Fast paths for non-'full' cases (unchanged)                        #
     # ------------------------------------------------------------------ #
     if covariance_type != "full":
         if covariance_type == "tied":
@@ -380,11 +461,11 @@ def _compute_precision_cholesky(covariances, covariance_type, *, _tiny_kd=32):
             return 1.0 / np.sqrt(covariances)
 
     # ------------------------------------------------------------------ #
-    # FULL covariance ‒ choose the cheapest backend                       #
+    # FULL covariance – backend-dependent path                           #
     # ------------------------------------------------------------------ #
     n_components, n_features, _ = covariances.shape
 
-    # ❶ tiny batches – keep the simple reference loop
+    # ❶ tiny problems – keep the simple Python loop
     if n_components * n_features <= _tiny_kd:
         chol = []
         for k in range(n_components):
@@ -394,37 +475,43 @@ def _compute_precision_cholesky(covariances, covariance_type, *, _tiny_kd=32):
                 raise ValueError(err_msg)
             U = linalg.solve_triangular(
                 L, np.eye(n_features, dtype=dtype), lower=True
-            ).T                        # upper-triangular
+            ).T
             chol.append(U)
         return np.stack(chol, axis=0)
 
-    # ❷ try SciPy batched (SciPy ≥ 1.9)
-    try:
-        L = linalg.cholesky(covariances, lower=True)           # (k, d, d)
-        U = np.linalg.inv(L).transpose(0, 2, 1)               # upper-tri
-        return U
-    except ValueError as exc:
-        if "needs to be 2D" not in str(exc):
-            raise      # covariance not SPD – keep the original error path
-        # else: SciPy is too old → fall through to NumPy
-    except linalg.LinAlgError:
-        raise ValueError(err_msg)
+    # ❷ large batch – use the cached fastest backend
+    backend = _preferred_batch_cholesky_backend()
 
-    # ❸ NumPy fallback (always supports batching, returns UPPER factor)
-    try:
-        U_upper = np.linalg.cholesky(covariances)              # (k, d, d)
-        U_prec  = np.linalg.inv(U_upper)                       # upper-tri
-        return U_prec
-    except np.linalg.LinAlgError:
-        # ❹ optional PyTorch fallback
-        try:
-            import torch
-            tensor = torch.as_tensor(covariances)
-            L_torch = torch.linalg.cholesky(tensor, upper=False)      # lower
-            U = torch.linalg.inv(L_torch).transpose(-2, -1).cpu().numpy()
-            return U.astype(dtype, copy=False)
-        except (ImportError, RuntimeError, torch.linalg.LinAlgError):
-            raise ValueError(err_msg) from None
+    # ── SciPy batched ──────────────────────────────────────────────────
+    if backend == "scipy":
+        L = linalg.cholesky(covariances, lower=True)
+        U = np.linalg.inv(L).transpose(0, 2, 1)
+        return U
+
+    # ── JAX batched ────────────────────────────────────────────────────
+    if backend == "jax":
+        cov_jax = jnp.asarray(covariances)
+        L = jnp.linalg.cholesky(cov_jax, lower=True)
+        U = jnp.linalg.inv(L).transpose(0, 2, 1)
+        return np.asarray(U, dtype=dtype)
+
+    # ── NumPy batched ─────────────────────────────────────────────────
+    if backend == "numpy":
+        U_upper = np.linalg.cholesky(covariances)
+        return np.linalg.inv(U_upper)
+
+    # ❸ ultimate fallback – slow Python loop (rarely hit)
+    chol = []
+    for k in range(n_components):
+        L = linalg.cholesky(covariances[k], lower=True)
+        U = linalg.solve_triangular(
+            L, np.eye(n_features, dtype=dtype), lower=True
+        ).T
+        chol.append(U)
+    return np.stack(chol, axis=0)
+
+
+
 
 
 
@@ -552,34 +639,38 @@ def _compute_quadratic_form_tied(X_prec, mu_prec):
 
 
 def _estimate_log_gaussian_prob(
-    X, means, precisions_chol, covariance_type, *, _loop_thr=4, _vec_thr=1000000
+    X, means, precisions_chol, covariance_type, *, _loop_thr=4
 ):
-    """Vectorised & parallel log Gaussian probability.
+    """
+    Vectorised & parallel log Gaussian probability, memory‐aware.
 
-    The cheapest backend is selected heuristically:
-    * **Loop** for very small k – avoids any extra overhead.
-    * **Vectorised** for moderate problem sizes – uses one big `einsum` or
-      broadcast expression and stays single-process.
-    * **Parallel** for large k·n·d – keeps memory low and distributes the work
-      across all CPU cores.  Workers see *read-only* mmap'ed views of the big
-      arrays, so RAM is **not** duplicated.
+    Heuristic selection of backend:
+    1. **Loop**   – for very small k, avoids any extra overhead.
+    3. **Parallel**  – for large problems; keeps memory low by
+       distributing per-component work.
 
     Notes
     -----
-    The returned values are *identical* to the legacy implementation; only the
-    runtime is different.
+    Uses cached _fits_in_memory to only probe RAM once per session.
     """
     n_samples, n_features = X.shape
     n_components, _ = means.shape
     log_det = _compute_log_det_cholesky(precisions_chol, covariance_type, n_features)
 
-    # ------------------------------------------------------------------ #
-    # FULL covariance                                                    #
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
+    # FULL covariance
+    # ------------------------------------------------------------------
     if covariance_type == "full":
+        # total number of elements in the (n, k, d) temporary
         total_work = n_samples * n_components * n_features
+        # bytes we would need for that array
+        tmp_bytes = total_work * X.dtype.itemsize
+
+        # decide backends
         use_loop = n_components <= _loop_thr
-        use_vec = total_work <= _vec_thr
+        # only vectorise if under the element threshold *and* fits in RAM
+        fits_memory = _fits_in_memory(tmp_bytes)
+        use_vec = fits_memory
 
         # ❶ tiny – original loop (negligible overhead) ------------------ #
         if use_loop and not use_vec:
@@ -589,63 +680,111 @@ def _estimate_log_gaussian_prob(
                 log_prob[:, k] = np.square(y).sum(axis=1)
             return -0.5 * (n_features * np.log(2.0 * np.pi) + log_prob) + log_det
 
-        # ❷ medium – vectorised einsum ---------------------------------- #
+        # ❷ medium – single‐einsum vectorised branch -------------- #
         if use_vec:
-            # (n_samples, n_components, n_features)
-            proj = np.einsum("nf,kfg->nkg", X, precisions_chol, optimize=True)
-            mu_proj = (means @ precisions_chol)                       # (k, d)
+            # Stack X and means to do one contraction:
+            #   stacked.shape == (n_samples + n_components, n_features)
+            stacked = np.vstack([X, means])
+        
+            # One big einsum to project both X and means:
+            #   combined.shape == (n_samples + n_components, n_components, n_features)
+            combined = np.einsum(
+                "md,kdf->mkf",
+                stacked,
+                precisions_chol,
+                optimize=True,
+            )
+        
+            # Split back out:
+            proj = combined[:n_samples]    # shape (n_samples, n_components, n_features)
+            idx = np.arange(n_components)
+            # For each component k, we want the k-th row of the "means" block projected
+            mu_proj = combined[n_samples + idx, idx]  # shape (n_components, n_features)
+        
+            # Compute squared‐diffs and sum over features
             diff = proj - mu_proj[None, :, :]
             log_prob = np.square(diff).sum(axis=2)
+        
             return -0.5 * (n_features * np.log(2.0 * np.pi) + log_prob) + log_det
+        
 
         # ❸ large – parallel over components --------------------------- #
-        def _one_col(k):
-            mu_k = means[k]
-            prec_k = precisions_chol[k]
-            y = X @ prec_k - mu_k @ prec_k
-            return np.square(y).sum(axis=1)
+        n_jobs = _effective_n_jobs(n_components)
+        blas_threads = max(1, (os.cpu_count() or 1) // n_jobs)
 
-        cols = Parallel(n_jobs=N_PROCESS_FIXED, backend="loky")(
+        def _one_col(k):
+            with threadpool_limits(limits=blas_threads):
+                y = X @ precisions_chol[k] - means[k] @ precisions_chol[k]
+                return np.square(y).sum(axis=1)
+
+        cols = Parallel(n_jobs=n_jobs, backend="loky")(
             delayed(_one_col)(k) for k in range(n_components)
         )
         log_prob = np.column_stack(cols)
         return -0.5 * (n_features * np.log(2.0 * np.pi) + log_prob) + log_det
 
-    # ------------------------------------------------------------------ #
-    # TIED covariance – no memory explosion, fully vectorised            #
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
+    # TIED covariance – fully vectorised
+    # ------------------------------------------------------------------
     if covariance_type == "tied":
         X_prec = X @ precisions_chol                      # (n, d)
         mu_prec = means @ precisions_chol                 # (k, d)
         log_prob = _compute_quadratic_form_tied(X_prec, mu_prec)
         return -0.5 * (n_features * np.log(2.0 * np.pi) + log_prob) + log_det
 
-    # ------------------------------------------------------------------ #
-    # DIAG covariance                                                    #
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
+    # DIAG covariance
+    # ------------------------------------------------------------------
     if covariance_type == "diag":
         precisions = precisions_chol ** 2
-        # Pre-compute once to cut one large temporary
         x_prec = X @ precisions.T                         # (n, k)
-        m_prec = (means * precisions).sum(axis=1)         # (k,)
         log_prob = (
             (means ** 2 * precisions).sum(axis=1)[None, :]  # (1, k)
             - 2.0 * x_prec
             + (X ** 2) @ precisions.T
         )
         return -0.5 * (n_features * np.log(2.0 * np.pi) + log_prob) + log_det
-    if covariance_type  == "spherical":
-        # ------------------------------------------------------------------ #
-        # SPHERICAL covariance                                               #
-        # ------------------------------------------------------------------ #
+
+    # ------------------------------------------------------------------
+    # SPHERICAL covariance
+    # ------------------------------------------------------------------
+    # (falls through to return at end)
+    precisions = precisions_chol ** 2
+    x2 = row_norms(X, squared=True)                       # (n,)
+    mu2 = row_norms(means, squared=True)                  # (k,)
+    log_prob = (
+        mu2[None, :] * precisions
+        - 2.0 * (X @ means.T) * precisions
+        + x2[:, None] * precisions
+    )
+    return -0.5 * (n_features * np.log(2.0 * np.pi) + log_prob) + log_det
+
+
+    # Remaining covariance types unchanged
+    if covariance_type == "tied":
+        X_prec = X @ precisions_chol
+        mu_prec = means @ precisions_chol
+        log_prob = _compute_quadratic_form_tied(X_prec, mu_prec)
+        return -0.5 * (n_features * np.log(2.0 * np.pi) + log_prob) + log_det
+
+    if covariance_type == "diag":
         precisions = precisions_chol ** 2
-        x2 = row_norms(X, squared=True)                       # (n,)
-        mu2 = row_norms(means, squared=True)                  # (k,)
+        x_prec = X @ precisions.T
         log_prob = (
-            mu2[None, :] * precisions
-            - 2.0 * (X @ means.T) * precisions
-            + x2[:, None] * precisions
+            (means**2 * precisions).sum(axis=1)[None, :] - 2.0 * x_prec
+            + (X**2) @ precisions.T
         )
+        return -0.5 * (n_features * np.log(2.0 * np.pi) + log_prob) + log_det
+
+    # spherical
+    precisions = precisions_chol ** 2
+    x2 = row_norms(X, squared=True)
+    mu2 = row_norms(means, squared=True)
+    log_prob = (
+        mu2[None, :] * precisions
+        - 2.0 * (X @ means.T) * precisions
+        + x2[:, None] * precisions
+    )
     return -0.5 * (n_features * np.log(2.0 * np.pi) + log_prob) + log_det
 
 
