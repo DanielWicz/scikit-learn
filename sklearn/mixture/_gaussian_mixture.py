@@ -5,11 +5,9 @@
 
 import numpy as np
 from scipy import linalg
-from joblib import Parallel, delayed
 import os
 from functools import lru_cache, partial
 from ..utils import check_array
-from threadpoolctl import threadpool_limits
 import psutil
 try:
     import jax.numpy as jnp
@@ -112,14 +110,32 @@ def _fits_in_memory(n_bytes, safety=0.95):
     return (n_bytes / (1024 ** 2)) < safety * avail_mb
 
 
+@lru_cache(maxsize=128)
+def _optimal_chunk_size(
+    n_samples: int,
+    n_features: int,
+    dtype: np.dtype = np.float64,
+    safety: float = 0.90,
+) -> int:
+    """
+    Return the largest number of mixture *components* that can be processed in
+    a single vectorised pass without exceeding the available RAM budget.
+
+    The chosen ``chunk`` satisfies::
+
+        n_samples · chunk · n_features · dtype.itemsize  <  safety · free-RAM
+
+    The function never returns a value < 1.
+    """
+    bytes_per_elem = np.dtype(dtype).itemsize
+    free_bytes = _available_ram() * 1024 ** 2 * safety
+    if free_bytes <= 0:                # psutil unavailable or unknown
+        return 1
+    max_k = int(free_bytes // (n_samples * n_features * bytes_per_elem))
+    return max(1, max_k)
 
 
-def _effective_n_jobs(n_tasks: int) -> int:
-    """Return a sensible job count (never > CPUs, never > n_tasks)."""
-    max_cpus = os.cpu_count() or 1
-    env = int(os.getenv("GMIX_N_JOBS", "-1"))
-    want = max_cpus if env < 0 else max(1, env)
-    return max(1, min(want, n_tasks, max_cpus))
+
 def _check_weights(weights, n_components):
     """Check the user provided 'weights'.
 
@@ -255,57 +271,55 @@ def _check_precisions(precisions, covariance_type, n_components, n_features):
 # Gaussian mixture parameters estimators (used by the M-Step)
 def _estimate_gaussian_covariances_full(resp, X, nk, means, reg_covar):
     """
-    Estimate full covariance matrices with an *adaptive* backend:
+    Estimate full covariance matrices **without** joblib.
 
-    1. Plain Python loop – fastest for very small ``n_components``.
-    2. One big vectorised einsum – fastest overall *iff* the temporary
-       fits into a safe fraction of available RAM.
-    3. Multi-process loop – low memory footprint, scales across cores,
-       *never* over-subscribes BLAS threads.
+    Strategy
+    --------
+    1.  Tiny problems → simple Python loop (cheap, minimal overhead).
+    2.  Fits RAM       → single vectorised einsum (fastest).
+    3.  Too large      → split the components into the *fewest* chunks that
+        fit RAM, run the same einsum per chunk, and concatenate.
     """
     n_components, n_features = means.shape
     n_samples = X.shape[0]
+    dtype = X.dtype
 
-    # -------------------------------------------------------------- #
-    # Heuristics                                                     #
-    # -------------------------------------------------------------- #
     LOOP_MAX_K = 4
-    use_loop = n_components <= LOOP_MAX_K
-    use_vec = _select_vectorised(n_samples, n_components, n_features, X.dtype)
-
-    # ❶ very small – plain loop
-    if use_loop and not use_vec:
-        cov = np.empty((n_components, n_features, n_features), dtype=X.dtype)
+    if n_components <= LOOP_MAX_K and not _select_vectorised(
+        n_samples, n_components, n_features, dtype
+    ):
+        # ---------- tiny: plain loop -----------------------------------
+        cov = np.empty((n_components, n_features, n_features), dtype=dtype)
         for k in range(n_components):
             diff = X - means[k]
-            cov_k = (resp[:, k][:, None] * diff).T @ diff / nk[k]
-            cov_k.flat[:: n_features + 1] += reg_covar
-            cov[k] = cov_k
+            c_k = (resp[:, k][:, None] * diff).T @ diff / nk[k]
+            c_k.flat[:: n_features + 1] += reg_covar
+            cov[k] = c_k
         return cov
 
-    # ❷ fits in RAM – vectorised einsum
-    if use_vec:
+    # ---------- one big einsum if it fits ------------------------------
+    if _select_vectorised(n_samples, n_components, n_features, dtype):
         diff = X[:, None, :] - means[None, :, :]
         cov = np.einsum("nk,nkf,nkg->kfg", resp, diff, diff, optimize=True)
         cov /= nk[:, None, None]
         cov[:, np.arange(n_features), np.arange(n_features)] += reg_covar
         return cov
 
-    # ❸ too big – fallback to multi-process loop
-    n_jobs = _effective_n_jobs(n_components)
-    blas_threads = max(1, (os.cpu_count() or 1) // n_jobs)
+    # ---------- fallback: chunk along components -----------------------
+    chunk_size = _optimal_chunk_size(n_samples, n_features, dtype)
+    cov_chunks = []
+    for start in range(0, n_components, chunk_size):
+        end = min(start + chunk_size, n_components)
+        diff = X[:, None, :] - means[start:end][None, :, :]
+        cov_chunk = np.einsum(
+            "nk,nkf,nkg->kfg", resp[:, start:end], diff, diff, optimize=True
+        )
+        cov_chunk /= nk[start:end, None, None]
+        cov_chunk[:, np.arange(n_features), np.arange(n_features)] += reg_covar
+        cov_chunks.append(cov_chunk)
 
-    def _one_cov(k):
-        with threadpool_limits(limits=blas_threads):
-            diff = X - means[k]
-            c = (resp[:, k][:, None] * diff).T @ diff / nk[k]
-            c.flat[:: n_features + 1] += reg_covar
-            return c
+    return np.concatenate(cov_chunks, axis=0)
 
-    covariances = Parallel(n_jobs=n_jobs, backend="loky")(
-        delayed(_one_cov)(k) for k in range(n_components)
-    )
-    return np.stack(covariances)
 
 
 
@@ -642,151 +656,95 @@ def _estimate_log_gaussian_prob(
     X, means, precisions_chol, covariance_type, *, _loop_thr=4
 ):
     """
-    Vectorised & parallel log Gaussian probability, memory‐aware.
+    Compute the per-sample per-component log-probability of a Gaussian.
 
-    Heuristic selection of backend:
-    1. **Loop**   – for very small k, avoids any extra overhead.
-    3. **Parallel**  – for large problems; keeps memory low by
-       distributing per-component work.
-
-    Notes
-    -----
-    Uses cached _fits_in_memory to only probe RAM once per session.
+    The *'full'*-covariance path has been rewritten to eliminate joblib.  If
+    the full n×k×d tensor would not fit into RAM, we iterate over the
+    *fewest* component-chunks that do.
     """
     n_samples, n_features = X.shape
     n_components, _ = means.shape
     log_det = _compute_log_det_cholesky(precisions_chol, covariance_type, n_features)
+    log2pi = n_features * np.log(2.0 * np.pi)
 
-    # ------------------------------------------------------------------
-    # FULL covariance
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------ #
+    # FULL covariance                                                    #
+    # ------------------------------------------------------------------ #
     if covariance_type == "full":
-        # total number of elements in the (n, k, d) temporary
-        total_work = n_samples * n_components * n_features
-        # bytes we would need for that array
-        tmp_bytes = total_work * X.dtype.itemsize
-
-        # decide backends
-        use_loop = n_components <= _loop_thr
-        # only vectorise if under the element threshold *and* fits in RAM
-        fits_memory = _fits_in_memory(tmp_bytes)
-        use_vec = fits_memory
-
-        # ❶ tiny – original loop (negligible overhead) ------------------ #
-        if use_loop and not use_vec:
-            log_prob = np.empty((n_samples, n_components), dtype=X.dtype)
+        if n_components <= _loop_thr and not _fits_in_memory(
+            n_samples * n_components * n_features * X.dtype.itemsize
+        ):
+            # ---- tiny: keep the simple loop ---------------------------
+            log_quad = np.empty((n_samples, n_components), dtype=X.dtype)
             for k, (mu, prec_chol) in enumerate(zip(means, precisions_chol)):
                 y = X @ prec_chol - mu @ prec_chol
-                log_prob[:, k] = np.square(y).sum(axis=1)
-            return -0.5 * (n_features * np.log(2.0 * np.pi) + log_prob) + log_det
+                log_quad[:, k] = np.square(y).sum(axis=1)
+            return -0.5 * (log2pi + log_quad) + log_det
 
-        # ❷ medium – single‐einsum vectorised branch -------------- #
-        if use_vec:
-            # Stack X and means to do one contraction:
-            #   stacked.shape == (n_samples + n_components, n_features)
-            stacked = np.vstack([X, means])
-        
-            # One big einsum to project both X and means:
-            #   combined.shape == (n_samples + n_components, n_components, n_features)
-            combined = np.einsum(
-                "md,kdf->mkf",
-                stacked,
-                precisions_chol,
-                optimize=True,
-            )
-        
-            # Split back out:
-            proj = combined[:n_samples]    # shape (n_samples, n_components, n_features)
-            idx = np.arange(n_components)
-            # For each component k, we want the k-th row of the "means" block projected
-            mu_proj = combined[n_samples + idx, idx]  # shape (n_components, n_features)
-        
-            # Compute squared‐diffs and sum over features
-            diff = proj - mu_proj[None, :, :]
-            log_prob = np.square(diff).sum(axis=2)
-        
-            return -0.5 * (n_features * np.log(2.0 * np.pi) + log_prob) + log_det
-        
+        if _fits_in_memory(n_samples * n_components * n_features * X.dtype.itemsize):
+            # ---- fits RAM: one vectorised shot ------------------------
+            stacked = np.vstack([X, means])                       # (n + k, d)
+            proj = np.einsum("md,kdf->mkf", stacked, precisions_chol, optimize=True)
+            proj_X = proj[:n_samples]                              # (n, k, d)
+            proj_mu = proj[n_samples + np.arange(n_components), np.arange(n_components)]
+            log_quad = np.square(proj_X - proj_mu[None, :, :]).sum(axis=2)
+            return -0.5 * (log2pi + log_quad) + log_det
 
-        # ❸ large – parallel over components --------------------------- #
-        n_jobs = _effective_n_jobs(n_components)
-        blas_threads = max(1, (os.cpu_count() or 1) // n_jobs)
+        # ---- large: iterate over the smallest RAM-safe chunks ---------
+        chunk_size = _optimal_chunk_size(n_samples, n_features, X.dtype)
+        log_quad = np.empty((n_samples, n_components), dtype=X.dtype)
 
-        def _one_col(k):
-            with threadpool_limits(limits=blas_threads):
-                y = X @ precisions_chol[k] - means[k] @ precisions_chol[k]
-                return np.square(y).sum(axis=1)
+        for start in range(0, n_components, chunk_size):
+            end = min(start + chunk_size, n_components)
+            prec_chunk = precisions_chol[start:end]          # (k_c, d, d)
+            mu_chunk   = means[start:end]                    # (k_c, d)
+            k_chunk    = end - start
 
-        cols = Parallel(n_jobs=n_jobs, backend="loky")(
-            delayed(_one_col)(k) for k in range(n_components)
-        )
-        log_prob = np.column_stack(cols)
-        return -0.5 * (n_features * np.log(2.0 * np.pi) + log_prob) + log_det
+            # -----------------------------------------------------------
+            # Prefer the *single-einsum* path if it still fits in RAM;
+            # fall back to the two-einsum variant otherwise.
+            # -----------------------------------------------------------
+            tmp_bytes = (n_samples + k_chunk) * k_chunk * n_features * X.dtype.itemsize
+            if _fits_in_memory(tmp_bytes):
+                # one big contraction → project X and μ at once
+                stacked = np.vstack([X, mu_chunk])           # (n + k_c, d)
+                proj = np.einsum("md,kdf->mkf", stacked, prec_chunk, optimize=True)
+                proj_X  = proj[:n_samples]                   # (n, k_c, d)
+                proj_mu = proj[n_samples + np.arange(k_chunk), np.arange(k_chunk)]
+            else:
+                # memory-lean two-einsum fallback
+                proj_X  = np.einsum("nd,kdf->nkf", X,       prec_chunk, optimize=True)
+                proj_mu = np.einsum("kd,kdf->kf",  mu_chunk, prec_chunk, optimize=True)
 
-    # ------------------------------------------------------------------
-    # TIED covariance – fully vectorised
-    # ------------------------------------------------------------------
-    if covariance_type == "tied":
-        X_prec = X @ precisions_chol                      # (n, d)
-        mu_prec = means @ precisions_chol                 # (k, d)
-        log_prob = _compute_quadratic_form_tied(X_prec, mu_prec)
-        return -0.5 * (n_features * np.log(2.0 * np.pi) + log_prob) + log_det
+            # quadratic form for this slice of components
+            log_quad[:, start:end] = np.square(proj_X - proj_mu[None, :, :]).sum(axis=2)
 
-    # ------------------------------------------------------------------
-    # DIAG covariance
-    # ------------------------------------------------------------------
-    if covariance_type == "diag":
-        precisions = precisions_chol ** 2
-        x_prec = X @ precisions.T                         # (n, k)
-        log_prob = (
-            (means ** 2 * precisions).sum(axis=1)[None, :]  # (1, k)
-            - 2.0 * x_prec
-            + (X ** 2) @ precisions.T
-        )
-        return -0.5 * (n_features * np.log(2.0 * np.pi) + log_prob) + log_det
+        return -0.5 * (log2pi + log_quad) + log_det
 
-    # ------------------------------------------------------------------
-    # SPHERICAL covariance
-    # ------------------------------------------------------------------
-    # (falls through to return at end)
-    precisions = precisions_chol ** 2
-    x2 = row_norms(X, squared=True)                       # (n,)
-    mu2 = row_norms(means, squared=True)                  # (k,)
-    log_prob = (
-        mu2[None, :] * precisions
-        - 2.0 * (X @ means.T) * precisions
-        + x2[:, None] * precisions
-    )
-    return -0.5 * (n_features * np.log(2.0 * np.pi) + log_prob) + log_det
-
-
-    # Remaining covariance types unchanged
+    # ------------------------------------------------------------------ #
+    # All other covariance types – unchanged (vectorised already).       #
+    # ------------------------------------------------------------------ #
     if covariance_type == "tied":
         X_prec = X @ precisions_chol
         mu_prec = means @ precisions_chol
-        log_prob = _compute_quadratic_form_tied(X_prec, mu_prec)
-        return -0.5 * (n_features * np.log(2.0 * np.pi) + log_prob) + log_det
+        quad = _compute_quadratic_form_tied(X_prec, mu_prec)
+        return -0.5 * (log2pi + quad) + log_det
 
     if covariance_type == "diag":
         precisions = precisions_chol ** 2
-        x_prec = X @ precisions.T
-        log_prob = (
-            (means**2 * precisions).sum(axis=1)[None, :] - 2.0 * x_prec
+        quad = (
+            (means**2 * precisions).sum(axis=1)[None, :]
+            - 2 * X @ (means * precisions).T
             + (X**2) @ precisions.T
         )
-        return -0.5 * (n_features * np.log(2.0 * np.pi) + log_prob) + log_det
+        return -0.5 * (log2pi + quad) + log_det
 
     # spherical
     precisions = precisions_chol ** 2
     x2 = row_norms(X, squared=True)
     mu2 = row_norms(means, squared=True)
-    log_prob = (
-        mu2[None, :] * precisions
-        - 2.0 * (X @ means.T) * precisions
-        + x2[:, None] * precisions
-    )
-    return -0.5 * (n_features * np.log(2.0 * np.pi) + log_prob) + log_det
-
+    quad = mu2[None, :] * precisions - 2 * (X @ means.T) * precisions + x2[:, None] * precisions
+    return -0.5 * (log2pi + quad) + log_det
 
 
 class GaussianMixture(BaseMixture):
