@@ -78,7 +78,7 @@ def _available_ram():
 
 @lru_cache(maxsize=1)
 def _select_vectorised(n_samples: int, n_components: int, n_features: int,
-                       dtype=np.float64, safety: float = 0.5) -> bool:
+                       dtype=np.float64, safety: float = 0.25) -> bool:
     """Decide whether the huge einsum tensor fits in RAM."""
     bytes_needed = (n_samples * n_components * n_features *
                     np.dtype(dtype).itemsize)
