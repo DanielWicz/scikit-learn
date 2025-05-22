@@ -315,7 +315,7 @@ def _estimate_gaussian_covariances_full(resp, X, nk, means, reg_covar):
         return cov32.astype(orig_dtype)
 
     # Compute total bytes for float32 tensor
-    total_bytes = n_samples * n_components * n_features * compute_dtype().itemsize
+    total_bytes = n_samples * n_components * n_features * compute_dtype().itemsize * 8 # 8 is number of operations times two
 
     # 2) medium: all-in-one batched matmul in float32
     if _fits_in_memory(total_bytes):
