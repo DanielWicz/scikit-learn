@@ -528,7 +528,8 @@ def _compute_precision_cholesky(covariances, covariance_type, *, _tiny_kd=32):
     # ── SciPy batched ──────────────────────────────────────────────────
     if backend == "scipy":
         L = linalg.cholesky(covariances, lower=True)
-        U = np.linalg.inv(L).transpose(0, 2, 1)
+        eye = np.eye(n_features, dtype=dtype)
+        U = linalg.solve_triangular(L, eye, lower=True).transpose(0, 2, 1)
         return U
 
     # ── JAX batched ────────────────────────────────────────────────────
